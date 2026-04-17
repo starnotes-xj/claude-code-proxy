@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build outputs
+/bin/
+/dist/
+/coverage.out
+
+# IDE / local state
+.idea/
+.vscode/
+.claude/
+.omx/
+.cache/
+.ai/
+
+# OS
+.DS_Store
+Thumbs.db
