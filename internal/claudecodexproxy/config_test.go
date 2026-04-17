@@ -130,19 +130,12 @@ wire_api = "chat_completions"
 	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "")
 	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_MODEL", "")
 
-	cfg, err := LoadConfigFromEnv()
-	if err != nil {
-		t.Fatalf("LoadConfigFromEnv() error = %v", err)
+	_, err := LoadConfigFromEnv()
+	if err == nil {
+		t.Fatalf("LoadConfigFromEnv() error = nil, want missing backend base URL error")
 	}
-
-	if cfg.BackendBaseURL != defaultBackendBase {
-		t.Fatalf("BackendBaseURL = %q, want %q", cfg.BackendBaseURL, defaultBackendBase)
-	}
-	if cfg.BackendModel != "" {
-		t.Fatalf("BackendModel = %q, want empty", cfg.BackendModel)
-	}
-	if cfg.BackendAPIKey != "from-codex-auth" {
-		t.Fatalf("BackendAPIKey = %q, want from-codex-auth", cfg.BackendAPIKey)
+	if !strings.Contains(err.Error(), "missing CLAUDE_CODE_PROXY_BACKEND_BASE_URL") {
+		t.Fatalf("error = %q, want missing backend base URL", err)
 	}
 }
 
@@ -154,15 +147,15 @@ func TestLoadConfigFromEnvIgnoresLoopbackClaudeSettings(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", filepath.Join(home, ".missing-codex"))
 	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "")
-	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "explicit-key")
 	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_MODEL", "")
 
 	_, err := LoadConfigFromEnv()
 	if err == nil {
-		t.Fatalf("LoadConfigFromEnv() error = nil, want missing API key error")
+		t.Fatalf("LoadConfigFromEnv() error = nil, want missing backend base URL error")
 	}
-	if !strings.Contains(err.Error(), "missing CLAUDE_CODE_PROXY_BACKEND_API_KEY") {
-		t.Fatalf("error = %q, want missing API key", err)
+	if !strings.Contains(err.Error(), "missing CLAUDE_CODE_PROXY_BACKEND_BASE_URL") {
+		t.Fatalf("error = %q, want missing backend base URL", err)
 	}
 }
 
@@ -175,6 +168,7 @@ func TestLoadConfigFromEnvParsesOptionalFlags(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_ENABLE_BACKEND_METADATA", "true")
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING", "true")
 	t.Setenv("CLAUDE_CODE_PROXY_ENABLE_MODEL_CAPABILITY_INIT", "true")
@@ -244,6 +238,7 @@ func TestLoadConfigFromEnvParsesDisableUserMetadataForwardingFalse(t *testing.T)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING", "false")
 
 	cfg, err := LoadConfigFromEnv()
@@ -264,6 +259,7 @@ func TestLoadConfigFromEnvParsesForwardUserMetadataFalse(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_FORWARD_USER_METADATA", "false")
 
 	cfg, err := LoadConfigFromEnv()
@@ -310,6 +306,7 @@ func TestLoadConfigFromEnvForwardUserMetadataOverridesDisableFlag(t *testing.T) 
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_FORWARD_USER_METADATA", "true")
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING", "true")
 
@@ -334,6 +331,7 @@ func TestLoadConfigFromEnvForwardUserMetadataIgnoresInvalidLegacyFlag(t *testing
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_FORWARD_USER_METADATA", "true")
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING", "maybe")
 
@@ -358,6 +356,7 @@ func TestLoadConfigFromEnvForwardUserMetadataFalseIgnoresInvalidLegacyFlag(t *te
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_FORWARD_USER_METADATA", "false")
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING", "maybe")
 
@@ -382,6 +381,7 @@ func TestLoadConfigFromEnvRejectsInvalidDisableUserMetadataForwarding(t *testing
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING", "maybe")
 
 	_, err := LoadConfigFromEnv()
@@ -402,6 +402,7 @@ func TestLoadConfigFromEnvRejectsInvalidForwardUserMetadata(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_FORWARD_USER_METADATA", "maybe")
 
 	_, err := LoadConfigFromEnv()
@@ -422,6 +423,7 @@ func TestLoadConfigFromEnvRejectsInvalidCapabilityReprobeTTL(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_CAPABILITY_REPROBE_TTL", "maybe")
 
 	_, err := LoadConfigFromEnv()
@@ -442,6 +444,7 @@ func TestLoadConfigFromEnvRejectsInvalidDisableContinuityMetadata(t *testing.T) 
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_CONTINUITY_METADATA", "maybe")
 
 	_, err := LoadConfigFromEnv()
@@ -462,6 +465,7 @@ func TestLoadConfigFromEnvRejectsInvalidDisablePromptCacheKey(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_PROMPT_CACHE_KEY", "maybe")
 
 	_, err := LoadConfigFromEnv()
@@ -482,6 +486,7 @@ func TestLoadConfigFromEnvRejectsInvalidAnonymousMode(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_ANONYMOUS_MODE", "maybe")
 
 	_, err := LoadConfigFromEnv()
@@ -502,6 +507,7 @@ func TestLoadConfigFromEnvParsesUserMetadataAllowlist(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("CODEX_HOME", codexHome)
+	setRequiredBackendBaseEnv(t)
 	t.Setenv("CLAUDE_CODE_PROXY_USER_METADATA_ALLOWLIST", "trace, tenant ,trace,,request_class")
 
 	cfg, err := LoadConfigFromEnv()
@@ -513,6 +519,98 @@ func TestLoadConfigFromEnvParsesUserMetadataAllowlist(t *testing.T) {
 	if !reflect.DeepEqual(cfg.UserMetadataAllowlist, want) {
 		t.Fatalf("UserMetadataAllowlist = %#v, want %#v", cfg.UserMetadataAllowlist, want)
 	}
+}
+
+func TestLoadConfigFromEnvRejectsMissingBackendBaseURL(t *testing.T) {
+	home := t.TempDir()
+	codexHome := filepath.Join(home, ".codex")
+
+	writeTestFile(t, filepath.Join(codexHome, "auth.json"), `{"OPENAI_API_KEY":"from-codex-auth"}`)
+
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "")
+
+	_, err := LoadConfigFromEnv()
+	if err == nil {
+		t.Fatalf("LoadConfigFromEnv() error = nil, want missing backend base URL error")
+	}
+	if !strings.Contains(err.Error(), "missing CLAUDE_CODE_PROXY_BACKEND_BASE_URL") {
+		t.Fatalf("error = %q, want missing backend base URL", err)
+	}
+}
+
+func TestLoadConfigFromEnvIgnoresProjectClaudeSettings(t *testing.T) {
+	projectDir := t.TempDir()
+	home := t.TempDir()
+	writeTestFile(t, filepath.Join(projectDir, ".claude", "settings.json"), `{"env":{"ANTHROPIC_BASE_URL":"https://project.example/codex","ANTHROPIC_AUTH_TOKEN":"project-key","ANTHROPIC_MODEL":"project-model"}}`)
+
+	t.Chdir(projectDir)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".missing-codex"))
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "explicit-key")
+
+	_, err := LoadConfigFromEnv()
+	if err == nil {
+		t.Fatalf("LoadConfigFromEnv() error = nil, want missing backend base URL error")
+	}
+	if !strings.Contains(err.Error(), "missing CLAUDE_CODE_PROXY_BACKEND_BASE_URL") {
+		t.Fatalf("error = %q, want missing backend base URL", err)
+	}
+}
+
+func TestLoadConfigFromEnvRejectsNonLoopbackListenWithoutClientAPIKey(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "backend-key")
+	t.Setenv("CLAUDE_CODE_PROXY_LISTEN_ADDR", "0.0.0.0:8787")
+	t.Setenv("CLAUDE_CODE_PROXY_CLIENT_API_KEY", "")
+
+	_, err := LoadConfigFromEnv()
+	if err == nil {
+		t.Fatalf("LoadConfigFromEnv() error = nil, want missing client api key error")
+	}
+	if !strings.Contains(err.Error(), "CLAUDE_CODE_PROXY_CLIENT_API_KEY") {
+		t.Fatalf("error = %q, want missing client api key", err)
+	}
+}
+
+func TestLoadConfigFromEnvAllowsLoopbackListenWithoutClientAPIKey(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "backend-key")
+	t.Setenv("CLAUDE_CODE_PROXY_LISTEN_ADDR", "127.0.0.1:8787")
+	t.Setenv("CLAUDE_CODE_PROXY_CLIENT_API_KEY", "")
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("LoadConfigFromEnv() error = %v", err)
+	}
+	if cfg.ClientAPIKey != "" {
+		t.Fatalf("ClientAPIKey = %q, want empty", cfg.ClientAPIKey)
+	}
+}
+
+func TestLoadConfigFromEnvAllowsNonLoopbackListenWithClientAPIKey(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "backend-key")
+	t.Setenv("CLAUDE_CODE_PROXY_LISTEN_ADDR", "0.0.0.0:8787")
+	t.Setenv("CLAUDE_CODE_PROXY_CLIENT_API_KEY", "client-key")
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("LoadConfigFromEnv() error = %v", err)
+	}
+	if cfg.ClientAPIKey != "client-key" {
+		t.Fatalf("ClientAPIKey = %q, want client-key", cfg.ClientAPIKey)
+	}
+}
+
+func setRequiredBackendBaseEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
 }
 
 func writeTestFile(t *testing.T, path, content string) {

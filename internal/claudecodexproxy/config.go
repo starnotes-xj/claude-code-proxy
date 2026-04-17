@@ -3,6 +3,7 @@ package claudecodexproxy
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,7 +16,6 @@ import (
 
 const (
 	defaultListenAddr            = "127.0.0.1:8787"
-	defaultBackendBase           = "https://rawchat.cn/codex"
 	defaultBackendPath           = "/v1/responses"
 	defaultRequestTimeout        = 120 * time.Second
 	defaultCapabilityReprobeTTL  = 30 * time.Minute
@@ -28,6 +28,7 @@ type Config struct {
 	BackendBaseURL                string
 	BackendPath                   string
 	BackendAPIKey                 string
+	ClientAPIKey                  string
 	BackendModel                  string
 	BackendWarmupModel            string
 	AnthropicModelAlias           string
@@ -38,7 +39,7 @@ type Config struct {
 	ClaudeTokenMultiplier         float64
 	CapabilityReprobeTTL          time.Duration
 	EnableBackendMetadata         bool
-	AnonymousMode                bool
+	AnonymousMode                 bool
 	ForwardUserMetadata           *bool
 	UserMetadataAllowlist         []string
 	DisableContinuityMetadata     bool
@@ -54,9 +55,10 @@ func LoadConfigFromEnv() (Config, error) {
 	discovered := discoverFallbackConfig()
 	cfg := Config{
 		ListenAddr:          getEnv("CLAUDE_CODE_PROXY_LISTEN_ADDR", defaultListenAddr),
-		BackendBaseURL:      firstNonEmpty(normalizeBackendBaseURL(os.Getenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL")), discovered.BackendBaseURL, defaultBackendBase),
+		BackendBaseURL:      firstNonEmpty(normalizeBackendBaseURL(os.Getenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL")), discovered.BackendBaseURL),
 		BackendPath:         normalizeBackendPath(getEnv("CLAUDE_CODE_PROXY_BACKEND_PATH", defaultBackendPath)),
 		BackendAPIKey:       firstNonEmpty(strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY")), discovered.BackendAPIKey),
+		ClientAPIKey:        strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_CLIENT_API_KEY")),
 		BackendModel:        firstNonEmpty(strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_BACKEND_MODEL")), discovered.BackendModel),
 		BackendWarmupModel:  strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_WARMUP_MODEL")),
 		RequestTimeout:      defaultRequestTimeout,
@@ -69,6 +71,9 @@ func LoadConfigFromEnv() (Config, error) {
 		CapabilityReprobeTTL:  defaultCapabilityReprobeTTL,
 	}
 
+	if cfg.BackendBaseURL == "" {
+		return Config{}, fmt.Errorf("missing CLAUDE_CODE_PROXY_BACKEND_BASE_URL")
+	}
 	if cfg.BackendAPIKey == "" {
 		return Config{}, fmt.Errorf("missing CLAUDE_CODE_PROXY_BACKEND_API_KEY")
 	}
@@ -184,6 +189,9 @@ func LoadConfigFromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("invalid CLAUDE_CODE_PROXY_CAPABILITY_REPROBE_TTL: %w", err)
 		}
 		cfg.CapabilityReprobeTTL = parsed
+	}
+	if !isLoopbackListenAddr(cfg.ListenAddr) && cfg.ClientAPIKey == "" {
+		return Config{}, fmt.Errorf("missing CLAUDE_CODE_PROXY_CLIENT_API_KEY for non-loopback CLAUDE_CODE_PROXY_LISTEN_ADDR")
 	}
 
 	return cfg, nil
@@ -385,11 +393,6 @@ func candidateClaudeSettingsPaths() []string {
 		paths = append(paths, path)
 	}
 
-	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
-		addPath(filepath.Join(cwd, ".claude", "settings.local.json"))
-		addPath(filepath.Join(cwd, ".claude", "settings.json"))
-	}
-
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		addPath(filepath.Join(home, ".claude", "settings.local.json"))
 		addPath(filepath.Join(home, ".claude", "settings.json"))
@@ -469,4 +472,28 @@ func isLoopbackBaseURL(raw string) bool {
 	default:
 		return false
 	}
+}
+
+func isLoopbackListenAddr(raw string) bool {
+	addr := strings.TrimSpace(raw)
+	if addr == "" {
+		return false
+	}
+
+	host := addr
+	if parsedHost, _, err := net.SplitHostPort(addr); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return false
+	}
+
+	switch strings.ToLower(host) {
+	case "localhost":
+		return true
+	}
+
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

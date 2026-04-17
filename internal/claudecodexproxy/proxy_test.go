@@ -32,6 +32,37 @@ func toolOutputStringForTest(t *testing.T, output any) string {
 	}
 }
 
+func newClientAuthProxyForTest(t *testing.T, clientAPIKey string) (*Proxy, *int, func()) {
+	t.Helper()
+
+	backendHits := new(int)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*backendHits++
+		writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{
+			ID:     "resp_ok",
+			Output: []OpenAIOutputItem{{Type: "message", Role: "assistant", Content: []OpenAIOutputContent{{Type: "output_text", Text: "ok"}}}},
+			Usage:  OpenAIUsage{InputTokens: 1, OutputTokens: 1},
+		})
+	}))
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		ClientAPIKey:   clientAPIKey,
+	})
+	return proxy, backendHits, backend.Close
+}
+
+func newBasicMessagesRequest() *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	return request
+}
+
 func TestBuildBackendRequestConvertsToolHistory(t *testing.T) {
 	cfg := Config{
 		BackendBaseURL:        "https://example.com/codex",
@@ -564,6 +595,147 @@ func TestHandleMessagesDoesNotSendPromptCacheKeyWhenDisabled(t *testing.T) {
 	}
 	if _, ok := requests[0]["prompt_cache_key"]; ok {
 		t.Fatalf("prompt_cache_key should be absent when disabled: %#v", requests[0])
+	}
+}
+
+func TestHandlerRejectsMessagesWithoutClientAuth(t *testing.T) {
+	proxy, backendHits, cleanup := newClientAuthProxyForTest(t, "client-key")
+	defer cleanup()
+
+	recorder := httptest.NewRecorder()
+	request := newBasicMessagesRequest()
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if *backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", *backendHits)
+	}
+}
+
+func TestHandlerRejectsMessagesWithWrongClientAuth(t *testing.T) {
+	proxy, backendHits, cleanup := newClientAuthProxyForTest(t, "client-key")
+	defer cleanup()
+
+	recorder := httptest.NewRecorder()
+	request := newBasicMessagesRequest()
+	request.Header.Set("Authorization", "Bearer wrong-key")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if *backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", *backendHits)
+	}
+}
+
+func TestHandlerAcceptsMessagesWithBearerClientAuth(t *testing.T) {
+	proxy, backendHits, cleanup := newClientAuthProxyForTest(t, "client-key")
+	defer cleanup()
+
+	recorder := httptest.NewRecorder()
+	request := newBasicMessagesRequest()
+	request.Header.Set("Authorization", "Bearer client-key")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if *backendHits != 1 {
+		t.Fatalf("backend hits = %d, want 1", *backendHits)
+	}
+}
+
+func TestHandlerAcceptsMessagesWithXAPIKeyClientAuth(t *testing.T) {
+	proxy, backendHits, cleanup := newClientAuthProxyForTest(t, "client-key")
+	defer cleanup()
+
+	recorder := httptest.NewRecorder()
+	request := newBasicMessagesRequest()
+	request.Header.Set("x-api-key", "client-key")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if *backendHits != 1 {
+		t.Fatalf("backend hits = %d, want 1", *backendHits)
+	}
+}
+
+func TestHandlerLeavesHealthzUnauthenticated(t *testing.T) {
+	proxy := New(Config{
+		BackendBaseURL: "https://example.com/codex",
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		ClientAPIKey:   "client-key",
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandlerProtectsModelsAndCountTokensWhenClientAuthEnabled(t *testing.T) {
+	backendHits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		switch r.URL.Path {
+		case "/v1/models":
+			writeJSONWithStatus(w, http.StatusOK, map[string]any{
+				"object": "list",
+				"data": []map[string]any{
+					{"id": "gpt-5.4"},
+				},
+			})
+		default:
+			writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{
+				ID:     "resp_ok",
+				Output: []OpenAIOutputItem{{Type: "message", Role: "assistant", Content: []OpenAIOutputContent{{Type: "output_text", Text: "ok"}}}},
+				Usage:  OpenAIUsage{InputTokens: 1, OutputTokens: 1},
+			})
+		}
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		ClientAPIKey:   "client-key",
+	})
+
+	modelsRecorder := httptest.NewRecorder()
+	modelsRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	proxy.Handler().ServeHTTP(modelsRecorder, modelsRequest)
+	if modelsRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("models status = %d, body = %s", modelsRecorder.Code, modelsRecorder.Body.String())
+	}
+
+	countRecorder := httptest.NewRecorder()
+	countRequest := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	countRequest.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(countRecorder, countRequest)
+	if countRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("count_tokens status = %d, body = %s", countRecorder.Code, countRecorder.Body.String())
+	}
+
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", backendHits)
 	}
 }
 

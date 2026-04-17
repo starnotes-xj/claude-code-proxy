@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -176,10 +177,50 @@ func NewBackendRequestForTest(ctx context.Context, cfg Config, req AnthropicMess
 func (p *Proxy) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", p.handleHealthz)
-	mux.HandleFunc("/v1/messages", p.handleMessages)
-	mux.HandleFunc("/v1/messages/count_tokens", p.handleCountTokens)
-	mux.HandleFunc("/v1/models", p.handleModels)
+	mux.HandleFunc("/v1/messages", p.requireClientAuth(p.handleMessages))
+	mux.HandleFunc("/v1/messages/count_tokens", p.requireClientAuth(p.handleCountTokens))
+	mux.HandleFunc("/v1/models", p.requireClientAuth(p.handleModels))
 	return mux
+}
+
+func (p *Proxy) requireClientAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !p.isAuthorizedClient(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="claude-codex-proxy"`)
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid or missing client API key")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (p *Proxy) isAuthorizedClient(r *http.Request) bool {
+	expected := strings.TrimSpace(p.cfg.ClientAPIKey)
+	if expected == "" {
+		return true
+	}
+
+	if provided := strings.TrimSpace(r.Header.Get("x-api-key")); secureSecretCompare(provided, expected) {
+		return true
+	}
+
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	return ok && secureSecretCompare(token, expected)
+}
+
+func bearerToken(raw string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(raw))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return "", false
+	}
+	return fields[1], true
+}
+
+func secureSecretCompare(provided, expected string) bool {
+	if len(provided) == 0 || len(provided) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
 func (p *Proxy) handleHealthz(w http.ResponseWriter, _ *http.Request) {

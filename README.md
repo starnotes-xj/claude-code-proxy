@@ -11,9 +11,7 @@
 2. Codex 配置
    - `%USERPROFILE%\\.codex\\config.toml` / `$CODEX_HOME\\config.toml`
    - `%USERPROFILE%\\.codex\\auth.json` / `$CODEX_HOME\\auth.json`
-3. Claude Code 配置
-   - 当前项目 `.claude/settings.local.json`
-   - 当前项目 `.claude/settings.json`
+3. 当前用户的 Claude Code 配置
    - `%USERPROFILE%\\.claude\\settings.local.json`
    - `%USERPROFILE%\\.claude\\settings.json`
 
@@ -33,6 +31,7 @@
 
 - 如果 Claude Code 配置的是 Anthropic 风格地址（例如以 `/anthropic` 结尾），代理会自动归一化成 Responses 后端 base URL
 - 如果 Claude Code 配置指向的是本地代理地址（如 `127.0.0.1` / `localhost`），代理会自动忽略这类值，避免回环请求
+- 代理**不会**再自动读取当前项目目录下的 `.claude/settings*.json` 作为后端 fallback，避免不可信仓库重定向请求目标
 - 仍然推荐显式设置 `CLAUDE_CODE_PROXY_BACKEND_MODEL`，这样不会受客户端展示模型名影响
 
 ## 启动
@@ -44,6 +43,8 @@ $env:CLAUDE_CODE_PROXY_BACKEND_API_KEY = "<你的后端 key>"
 $env:CLAUDE_CODE_PROXY_BACKEND_MODEL = "gpt-5-codex"
 $env:CLAUDE_CODE_PROXY_BACKEND_BASE_URL = "https://example.com"
 $env:CLAUDE_CODE_PROXY_LISTEN_ADDR = "127.0.0.1:8787"
+# 非 loopback / 容器部署时，务必设置客户端共享密钥
+# $env:CLAUDE_CODE_PROXY_CLIENT_API_KEY = "<你的客户端 key>"
 
 go run ./cmd/claude-codex-proxy
 ```
@@ -57,6 +58,7 @@ go run ./cmd/claude-codex-proxy
 - `CLAUDE_CODE_PROXY_ANTHROPIC_API_KEY`，为 Claude 模型启用真实 `/v1/messages/count_tokens` 计数（也可回退使用 `ANTHROPIC_API_KEY`）
 - `CLAUDE_CODE_PROXY_ANTHROPIC_API_BASE_URL`，默认 `https://api.anthropic.com`
 - `CLAUDE_CODE_PROXY_CLAUDE_TOKEN_MULTIPLIER`，Claude fallback 估算倍率，默认 `1.15`
+- `CLAUDE_CODE_PROXY_CLIENT_API_KEY`，客户端访问代理时使用的共享密钥；当 `CLAUDE_CODE_PROXY_LISTEN_ADDR` 不是 loopback（如 `0.0.0.0:8787`）时必填。代理接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`
 - `CLAUDE_CODE_PROXY_ENABLE_BACKEND_METADATA=true`，显式把 Claude 请求里的 metadata 与部分头透传给后端（默认关闭，兼容不支持 metadata 的 Responses 后端）
 - `CLAUDE_CODE_PROXY_FORWARD_USER_METADATA=true|false`，控制是否转发用户原始 `metadata`；若与旧变量 `CLAUDE_CODE_PROXY_DISABLE_USER_METADATA_FORWARDING` 同时存在，以这个新变量为准
 - `CLAUDE_CODE_PROXY_USER_METADATA_ALLOWLIST=trace,tenant`，仅允许精确、大小写敏感匹配的用户 metadata key 透传；不会放开 `user_id` / `claude_code_*` 等永久阻断项；仅在 `CLAUDE_CODE_PROXY_FORWARD_USER_METADATA=true` 且 `CLAUDE_CODE_PROXY_ANONYMOUS_MODE=false` 时生效
@@ -74,19 +76,27 @@ $env:CLAUDE_CODE_PROXY_LISTEN_ADDR = "127.0.0.1:8787"
 go run ./cmd/claude-codex-proxy
 ```
 
+说明：
+
+- 本地 loopback 开发默认仍可不配 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
+- 如果监听地址是 `0.0.0.0`、`:` 前缀或其他非 loopback 地址，启动时必须设置 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
+
 ## Claude Code 配置
 
 PowerShell:
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
-$env:ANTHROPIC_AUTH_TOKEN = "proxy-local-placeholder"
+# 如果代理配置了 CLAUDE_CODE_PROXY_CLIENT_API_KEY，这里应设置成相同的值
+$env:ANTHROPIC_AUTH_TOKEN = "proxy-client-key-or-placeholder"
 $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 ```
 
 说明：
 
-- `ANTHROPIC_AUTH_TOKEN` 这里只是占位，当前本地代理不会校验它
+- 如果代理启用了 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`，Claude Code 侧也要把 `ANTHROPIC_AUTH_TOKEN` 设成相同密钥
+- 代理同时接受 `Authorization: Bearer <key>` 和 `x-api-key: <key>`，这样既兼容本地开发，也兼容容器/远程部署
+- 如果代理仅监听 `127.0.0.1` 且你没有配置 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`，`ANTHROPIC_AUTH_TOKEN` 仍可使用占位值
 - 实际请求会使用 `CLAUDE_CODE_PROXY_BACKEND_API_KEY` 去访问后端
 - 代理默认把 Claude Code 请求里的 `model` 映射到 `CLAUDE_CODE_PROXY_BACKEND_MODEL`
 - 为兼容部分不接受 `metadata` 参数的 OpenAI-format 后端，代理默认**不**向后端发送 metadata；如确实需要，可显式开启 `CLAUDE_CODE_PROXY_ENABLE_BACKEND_METADATA=true`
