@@ -17,6 +17,8 @@
 .omx/
 .cache/
 .ai/
+.env
+.env.*
 
 # OS
 .DS_Store

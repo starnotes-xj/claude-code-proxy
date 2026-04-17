@@ -2087,6 +2087,70 @@ func TestBuildBackendRequestNormalizesObjectToolSchemaWithoutProperties(t *testi
 	}
 }
 
+func TestBuildBackendRequestRecursivelyNormalizesObjectToolSchemas(t *testing.T) {
+	cfg := Config{
+		BackendBaseURL: "https://example.com/codex",
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "test-key",
+		BackendModel:   "gpt-5.4",
+	}
+
+	req, err := NewBackendRequestForTest(context.Background(), cfg, AnthropicMessagesRequest{
+		Model:    "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{{Role: "user", Content: "hi"}},
+		Tools: []AnthropicTool{
+			{
+				Name:        "nested_schema_tool",
+				Description: "nested object schemas omit properties",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"config": map[string]any{"type": "object"},
+						"items": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "object"},
+						},
+						"choice": map[string]any{
+							"anyOf": []any{
+								map[string]any{"type": "object"},
+								map[string]any{"type": "string"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+	tools := raw["tools"].([]any)
+	tool := tools[0].(map[string]any)
+	parameters := tool["parameters"].(map[string]any)
+	properties := parameters["properties"].(map[string]any)
+
+	configSchema := properties["config"].(map[string]any)
+	if _, ok := configSchema["properties"].(map[string]any); !ok {
+		t.Fatalf("nested object schema missing properties: %#v", configSchema)
+	}
+	itemsSchema := properties["items"].(map[string]any)
+	itemSchema := itemsSchema["items"].(map[string]any)
+	if _, ok := itemSchema["properties"].(map[string]any); !ok {
+		t.Fatalf("array item object schema missing properties: %#v", itemSchema)
+	}
+	choiceSchema := properties["choice"].(map[string]any)
+	anyOf := choiceSchema["anyOf"].([]any)
+	choiceObject := anyOf[0].(map[string]any)
+	if _, ok := choiceObject["properties"].(map[string]any); !ok {
+		t.Fatalf("anyOf object schema missing properties: %#v", choiceObject)
+	}
+}
+
 func TestBuildBackendRequestPreservesStructuredToolResultContentAsArrayOutput(t *testing.T) {
 	cfg := Config{
 		BackendBaseURL: "https://example.com/codex",
@@ -2142,11 +2206,11 @@ func TestBuildBackendRequestPreservesStructuredToolResultContentAsArrayOutput(t 
 		t.Fatalf("structured tool_result output not preserved as array: %#v", payload.Input[1].Output)
 	}
 	textBlock, ok := content[0].(map[string]any)
-	if !ok || textBlock["type"] != "text" || textBlock["text"] != "stdout" {
+	if !ok || textBlock["type"] != "input_text" || textBlock["text"] != "stdout" {
 		t.Fatalf("text block not preserved: %#v", content[0])
 	}
 	jsonBlock, ok := content[1].(map[string]any)
-	if !ok || jsonBlock["type"] != "json" {
+	if !ok || jsonBlock["type"] != "input_text" || jsonBlock["text"] != `{"findings":[{"id":"F-1","severity":"high"}]}` {
 		t.Fatalf("json block not preserved: %#v", content[1])
 	}
 }
@@ -3111,6 +3175,48 @@ func TestHandleMessagesNonStreamAggregatesBackendSSE(t *testing.T) {
 		t.Fatalf("aggregated content incorrect: %#v", response.Content)
 	}
 	if response.Usage.InputTokens != 4 || response.Usage.OutputTokens != 2 {
+		t.Fatalf("usage incorrect: %#v", response.Usage)
+	}
+}
+
+func TestHandleMessagesNonStreamAggregatesContentPartAddedText(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.content_part.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"hello from added\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		BackendModel:   "gpt-5.4",
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	var response AnthropicMessageResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode anthropic response: %v", err)
+	}
+	if len(response.Content) != 1 || response.Content[0].Text != "hello from added" {
+		t.Fatalf("aggregated content_part.added text incorrect: %#v", response.Content)
+	}
+	if response.Usage.InputTokens != 4 || response.Usage.OutputTokens != 3 {
 		t.Fatalf("usage incorrect: %#v", response.Usage)
 	}
 }

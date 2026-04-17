@@ -2841,6 +2841,10 @@ func flattenToolResult(raw any) string {
 				} else {
 					parts = append(parts, "[tool reference loaded]")
 				}
+			case "json":
+				if text := stableJSONText(firstNonNil(block.JSON, block.Content)); text != "" {
+					parts = append(parts, text)
+				}
 			case "image":
 				parts = append(parts, summarizeToolResultImage(block))
 			case "document", "file":
@@ -2911,6 +2915,10 @@ func convertToolResultOutput(raw any, allowStructured bool) any {
 				name = "unknown"
 			}
 			content = append(content, OpenAIContentItem{Type: "input_text", Text: "Tool " + name + " loaded"})
+		case "json":
+			if text := stableJSONText(firstNonNil(block.JSON, block.Content)); text != "" {
+				content = append(content, OpenAIContentItem{Type: "input_text", Text: text})
+			}
 		case "image":
 			if item, err := convertImageBlock(block); err == nil {
 				content = append(content, item)
@@ -2990,7 +2998,7 @@ func hasUnsupportedStructuredToolResultBlock(blocks []AnthropicContentBlock) boo
 
 func isStructuredToolResultTypeSupported(blockType string) bool {
 	switch blockType {
-	case "text", "tool_reference", "image", "document", "file":
+	case "text", "tool_reference", "json", "image", "document", "file":
 		return true
 	default:
 		return false
@@ -3020,6 +3028,26 @@ func preserveToolResultContentAsJSON(blocks []AnthropicContentBlock) string {
 	blob, err := json.Marshal(map[string]any{"content": blocks})
 	if err != nil {
 		return flattenToolResult(blocks)
+	}
+	return string(blob)
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func stableJSONText(value any) string {
+	if value == nil {
+		return ""
+	}
+	blob, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprintf("%v", value)
 	}
 	return string(blob)
 }
@@ -3268,14 +3296,97 @@ func normalizeToolSchema(schema any) any {
 func normalizeToolSchemaMap(schema map[string]any) map[string]any {
 	normalized := make(map[string]any, len(schema)+1)
 	for key, value := range schema {
-		normalized[key] = value
+		normalized[key] = normalizeToolSchemaField(key, value)
 	}
-	if strings.EqualFold(asString(normalized["type"]), "object") {
+	if schemaTypeIncludesObject(normalized["type"]) {
 		if _, ok := normalized["properties"]; !ok {
 			normalized["properties"] = map[string]any{}
 		}
 	}
 	return normalized
+}
+
+func normalizeToolSchemaField(key string, value any) any {
+	switch key {
+	case "properties", "$defs", "definitions", "patternProperties", "dependentSchemas":
+		return normalizeSchemaMapValues(value)
+	case "items", "additionalProperties", "not", "if", "then", "else":
+		return normalizeToolSchemaValue(value)
+	case "anyOf", "oneOf", "allOf":
+		return normalizeSchemaList(value)
+	default:
+		return value
+	}
+}
+
+func normalizeSchemaMapValues(value any) any {
+	decoded := decodeJSONMapValue(value)
+	if decoded == nil {
+		return value
+	}
+	normalized := make(map[string]any, len(decoded))
+	for key, nested := range decoded {
+		normalized[key] = normalizeToolSchemaValue(nested)
+	}
+	return normalized
+}
+
+func normalizeSchemaList(value any) any {
+	items, ok := value.([]any)
+	if !ok {
+		return value
+	}
+	normalized := make([]any, 0, len(items))
+	for _, item := range items {
+		normalized = append(normalized, normalizeToolSchemaValue(item))
+	}
+	return normalized
+}
+
+func normalizeToolSchemaValue(value any) any {
+	if decoded := decodeJSONMapValue(value); decoded != nil {
+		return normalizeToolSchemaMap(decoded)
+	}
+	return value
+}
+
+func decodeJSONMapValue(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case map[string]json.RawMessage:
+		blob, err := json.Marshal(typed)
+		if err != nil {
+			return nil
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(blob, &decoded); err != nil {
+			return nil
+		}
+		return decoded
+	default:
+		return nil
+	}
+}
+
+func schemaTypeIncludesObject(raw any) bool {
+	switch typed := raw.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "object")
+	case []any:
+		for _, item := range typed {
+			if schemaTypeIncludesObject(item) {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range typed {
+			if strings.EqualFold(strings.TrimSpace(item), "object") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func convertToolChoice(choice *AnthropicToolChoice) any {
@@ -4434,6 +4545,15 @@ func (a *streamAccumulator) handle(eventName, payload string) error {
 		}
 		item := a.ensureMessageOutput(event.ItemID)
 		item.Content = setOutputTextContent(item.Content, event.ContentIndex, text, "output_text")
+	case "response.content_part.added":
+		if event.Part != nil && event.Part.Type == "output_text" && strings.TrimSpace(event.Part.Text) != "" {
+			key := textBlockKey(event.ItemID, event.ContentIndex)
+			if a.textParts[key] == "" {
+				a.textParts[key] = event.Part.Text
+			}
+			item := a.ensureMessageOutput(event.ItemID)
+			item.Content = setOutputTextContent(item.Content, event.ContentIndex, a.textParts[key], "output_text")
+		}
 	case "response.content_part.done":
 		if event.Part != nil && event.Part.Type == "output_text" {
 			item := a.ensureMessageOutput(event.ItemID)

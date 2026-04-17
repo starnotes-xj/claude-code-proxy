@@ -53,6 +53,7 @@ type AnthropicContentBlock struct {
 	Input        json.RawMessage  `json:"input,omitempty"`
 	ToolUseID    string           `json:"tool_use_id,omitempty"`
 	IsError      bool             `json:"is_error,omitempty"`
+	JSON         any              `json:"json,omitempty"`
 	Content      any              `json:"content,omitempty"`
 	Source       *AnthropicSource `json:"source,omitempty"`
 	Title        string           `json:"title,omitempty"`

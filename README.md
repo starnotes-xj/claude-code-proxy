@@ -80,6 +80,7 @@ go run ./cmd/claude-codex-proxy
 
 - 本地 loopback 开发默认仍可不配 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
 - 如果监听地址是 `0.0.0.0`、`:` 前缀或其他非 loopback 地址，启动时必须设置 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
+- Docker / compose 本地运行请见 [`docs/docker-local.md`](docs/docker-local.md)。Docker 模式下容器内监听 `0.0.0.0:8787`、宿主机只绑定 `127.0.0.1:8787`，因此 `CLAUDE_CODE_PROXY_CLIENT_API_KEY` 应视为必填。
 
 ## Claude Code 配置
 
