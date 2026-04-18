@@ -53,7 +53,7 @@
 #### 1. 准备配置文件
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/starnotes-xj/claude-code-proxy.git
 cd claude-code-proxy
 ```
 
