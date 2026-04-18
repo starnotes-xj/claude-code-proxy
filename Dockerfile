@@ -5,13 +5,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY cmd ./cmd
+COPY main.go ./
 COPY internal ./internal
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/claude-codex-proxy ./cmd/claude-codex-proxy
+    go build -trimpath -ldflags="-s -w" -o /out/claude-codex-proxy .
 
 FROM alpine:3.22
 
@@ -21,7 +21,8 @@ RUN apk add --no-cache ca-certificates \
     && mkdir -p /app /home/app \
     && chown -R app:app /app /home/app
 
-ENV HOME=/home/app
+ENV HOME=/home/app \
+    CLAUDE_CODE_PROXY_LISTEN_ADDR=0.0.0.0:8787
 WORKDIR /app
 
 COPY --from=build /out/claude-codex-proxy /usr/local/bin/claude-codex-proxy

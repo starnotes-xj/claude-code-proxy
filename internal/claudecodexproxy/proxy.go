@@ -137,6 +137,7 @@ type backendRequestOptions struct {
 	PreserveReasoningItems            bool
 	EnableBackendStreaming            bool
 	EnableParallelToolCalls           bool
+	StripRoundTripItemIDs             bool
 	UsesRequestModelPassthrough       bool
 }
 
@@ -1367,6 +1368,10 @@ func (p *Proxy) buildBackendRequestWithOptions(ctx context.Context, anthropicReq
 			input = dropCompactionInputItems(input)
 		}
 	}
+	input = stripReasoningItemIDsWithoutEncryptedContent(input)
+	if opts.StripRoundTripItemIDs {
+		input = stripRoundTripHistoryItemIDs(input)
+	}
 
 	backendReq := OpenAIResponsesRequest{
 		Model:           opts.Model,
@@ -1377,7 +1382,7 @@ func (p *Proxy) buildBackendRequestWithOptions(ctx context.Context, anthropicReq
 		MaxOutputTokens: opts.MaxOutputTokens,
 		Temperature:     anthropicReq.Temperature,
 		TopP:            anthropicReq.TopP,
-		Store:           false,
+		Store:           true,
 		Stream:          opts.EnableBackendStreaming,
 	}
 	if opts.EnableContextManagement {
@@ -1466,11 +1471,17 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 
 		p.debugf("adaptive retry disabling feature=%s status=%d body=%s", feature, resp.StatusCode, sanitizeLogValue(string(body)))
 		tried[feature] = true
+		if feature == "input_item_persistence" {
+			opts.StripRoundTripItemIDs = true
+			continue
+		}
 		if feature == "model" && strings.TrimSpace(p.cfg.BackendModel) == "" {
 			p.fetchBackendModels()
 		}
 		p.setCapabilityUnsupported(feature, opts)
-		opts = p.optionsForRequest(anthropicReq, headers)
+		nextOpts := p.optionsForRequest(anthropicReq, headers)
+		nextOpts.StripRoundTripItemIDs = opts.StripRoundTripItemIDs
+		opts = nextOpts
 	}
 	return nil, OpenAIResponsesRequest{}, fmt.Errorf("adaptive retry exhausted")
 }
@@ -1500,6 +1511,8 @@ func (p *Proxy) classifyCapabilityFailure(status int, body []byte, opts backendR
 		return "context_management"
 	case requestUsesCompactionInput(payload) && matchesCompactionInputFailure(msg):
 		return "compaction_input"
+	case requestUsesRoundTripHistoryItems(payload) && matchesInputItemPersistenceFailure(msg):
+		return "input_item_persistence"
 	case opts.UsesRequestModelPassthrough && matchesModelFailure(msg, hint.Param, hint.Code):
 		return "model"
 	default:
@@ -1543,6 +1556,19 @@ func requestUsesPhaseCommentary(payload OpenAIResponsesRequest) bool {
 func requestUsesCompactionInput(payload OpenAIResponsesRequest) bool {
 	for _, item := range payload.Input {
 		if strings.EqualFold(strings.TrimSpace(item.Type), "compaction") {
+			return true
+		}
+	}
+	return false
+}
+
+func requestUsesRoundTripHistoryItems(payload OpenAIResponsesRequest) bool {
+	for _, item := range payload.Input {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(item.Type)) {
+		case "reasoning", "compaction":
 			return true
 		}
 	}
@@ -1846,6 +1872,11 @@ func matchesCompactionInputFailure(msg string) bool {
 	return strings.Contains(msg, "compaction") &&
 		(strings.Contains(msg, "unsupported") || strings.Contains(msg, "invalid") || strings.Contains(msg, "unknown") || strings.Contains(msg, "unrecognized")) &&
 		(strings.Contains(msg, "input") || strings.Contains(msg, "item") || strings.Contains(msg, "type"))
+}
+
+func matchesInputItemPersistenceFailure(msg string) bool {
+	return strings.Contains(msg, "items are not persisted when `store` is set to false") ||
+		(strings.Contains(msg, "item with id") && strings.Contains(msg, "not found") && strings.Contains(msg, "input"))
 }
 
 func matchesModelFailure(msg, observedParam, observedCode string) bool {
@@ -2771,7 +2802,11 @@ func encodeReasoningCarrier(item OpenAIOutputItem) string {
 	if item.Type != "reasoning" {
 		return ""
 	}
-	payload, err := json.Marshal(item)
+	sanitized := item
+	if strings.TrimSpace(sanitized.EncryptedContent) == "" {
+		sanitized.ID = ""
+	}
+	payload, err := json.Marshal(sanitized)
 	if err != nil {
 		return ""
 	}
@@ -2802,6 +2837,46 @@ func decodeReasoningCarrier(raw string) (OpenAIInputItem, bool) {
 		Summary:          item.Summary,
 		Status:           item.Status,
 	}, true
+}
+
+func stripReasoningItemIDsWithoutEncryptedContent(items []OpenAIInputItem) []OpenAIInputItem {
+	var sanitized []OpenAIInputItem
+	for idx, item := range items {
+		if !strings.EqualFold(strings.TrimSpace(item.Type), "reasoning") {
+			continue
+		}
+		if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.EncryptedContent) != "" {
+			continue
+		}
+		if sanitized == nil {
+			sanitized = append([]OpenAIInputItem(nil), items...)
+		}
+		sanitized[idx].ID = ""
+	}
+	if sanitized == nil {
+		return items
+	}
+	return sanitized
+}
+
+func stripRoundTripHistoryItemIDs(items []OpenAIInputItem) []OpenAIInputItem {
+	var sanitized []OpenAIInputItem
+	for idx, item := range items {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(item.Type)) {
+		case "reasoning", "compaction":
+			if sanitized == nil {
+				sanitized = append([]OpenAIInputItem(nil), items...)
+			}
+			sanitized[idx].ID = ""
+		}
+	}
+	if sanitized == nil {
+		return items
+	}
+	return sanitized
 }
 
 func outputContentToInputContent(content []OpenAIOutputContent) []OpenAIContentItem {

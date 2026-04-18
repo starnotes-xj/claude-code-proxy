@@ -15,7 +15,64 @@
 
 ## 1. 准备 `.env.local`
 
-在仓库根目录新建 `.env.local`：
+如果你本机已经配置过 Codex / Claude Code，可以直接从本机配置生成 `.env.local`。
+
+Windows PowerShell：
+
+```powershell
+.\scripts\write-env-from-config.ps1
+```
+
+Linux：
+
+```bash
+bash scripts/write-env-from-config.sh
+```
+
+macOS Terminal：
+
+```bash
+bash scripts/write-env-from-config.sh
+```
+
+macOS Finder / double-click：
+
+```bash
+open scripts/write-env-from-config.command
+```
+
+> Linux / macOS 脚本依赖系统可用的 `python3`。`.command` 文件只是对 `write-env-from-config.sh` 的 Finder 友好包装；如果 Finder 提示没有执行权限，可先运行 `chmod +x scripts/write-env-from-config.command`。
+
+脚本会读取：
+
+- 当前 shell 里的 `CLAUDE_CODE_PROXY_*`
+- `%USERPROFILE%\.codex\config.toml` / `auth.json`
+- `%USERPROFILE%\.claude\settings.local.json` / `settings.json`
+
+并生成：
+
+```text
+.env.local
+```
+
+如果 `.env.local` 已存在，脚本默认不会覆盖；确认要覆盖时使用：
+
+```powershell
+.\scripts\write-env-from-config.ps1 -Force
+```
+
+```bash
+bash scripts/write-env-from-config.sh --force
+```
+
+也可以手动复制示例配置并填入真实值：
+
+```powershell
+Copy-Item env.example .env.local
+notepad .env.local
+```
+
+`.env.local` 至少需要包含：
 
 ```dotenv
 CLAUDE_CODE_PROXY_BACKEND_BASE_URL=https://your-backend.example.com
@@ -39,6 +96,7 @@ CLAUDE_CODE_PROXY_CLIENT_API_KEY=replace-with-a-local-shared-key
 
 说明：
 
+- `env.example` 可以提交到远程仓库，`.env.local` 不应提交
 - `compose.yaml` 通过 `docker compose --env-file .env.local ...` 读取这份配置
 - 也可以直接在 shell 里临时导出环境变量
 - 默认方案不依赖 `~/.codex` / `~/.claude` 的自动发现逻辑
@@ -48,6 +106,29 @@ CLAUDE_CODE_PROXY_CLIENT_API_KEY=replace-with-a-local-shared-key
 ```powershell
 docker compose --env-file .env.local up -d --build
 ```
+
+如果你已经从远程镜像仓库拉取了镜像，也可以不克隆源码，直接运行：
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  -e CLAUDE_CODE_PROXY_BACKEND_BASE_URL="https://your-backend.example.com" `
+  -e CLAUDE_CODE_PROXY_BACKEND_API_KEY="your-backend-api-key" `
+  -e CLAUDE_CODE_PROXY_BACKEND_MODEL="gpt-5.4" `
+  -e CLAUDE_CODE_PROXY_CLIENT_API_KEY="replace-with-a-local-shared-key" `
+  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
+```
+
+如果你已经准备好了 `.env.local`，则可以使用：
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  --env-file .env.local `
+  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
+```
+
+镜像内默认 `CLAUDE_CODE_PROXY_LISTEN_ADDR=0.0.0.0:8787`，因此 `docker run` 通常不需要额外设置监听地址。
 
 查看日志：
 
@@ -101,6 +182,9 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
   - 这是 Docker 端口映射所必需
 - **必须配置 client key**
   - 因为容器内监听不是 loopback，程序会强制要求 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
+- **不把个人配置或密钥打进镜像**
+  - 远程仓库 / 公开镜像只包含程序本体
+  - 后端 URL、后端 API key、客户端共享密钥都在运行时通过 env-file 或环境变量注入
 - **默认无 volume**
   - 不挂源码
   - 不挂 home 目录

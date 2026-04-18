@@ -2346,6 +2346,9 @@ func TestBuildBackendRequestConvertsDocumentURLAndReasoningCarrier(t *testing.T)
 	if len(payload.Include) == 0 || payload.Include[0] != "reasoning.encrypted_content" {
 		t.Fatalf("include missing reasoning.encrypted_content: %#v", payload.Include)
 	}
+	if !payload.Store {
+		t.Fatalf("store should stay enabled so returned reasoning carriers remain reusable across turns")
+	}
 }
 
 func TestBuildBackendRequestConvertsCompactionCarrier(t *testing.T) {
@@ -2382,6 +2385,52 @@ func TestBuildBackendRequestConvertsCompactionCarrier(t *testing.T) {
 	}
 	if payload.Input[0].Type != "compaction" || payload.Input[0].ID != "cmp_1" || payload.Input[0].EncryptedContent != "opaque-compaction" {
 		t.Fatalf("compaction carrier mapping incorrect: %#v", payload.Input[0])
+	}
+}
+
+func TestBuildBackendRequestDropsReasoningItemIDWithoutEncryptedContent(t *testing.T) {
+	cfg := Config{
+		BackendBaseURL: "https://example.com/codex",
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "test-key",
+		BackendModel:   "gpt-5.4",
+	}
+
+	carrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:      "rs_1",
+		Type:    "reasoning",
+		Summary: []OpenAIReasoningPart{{Type: "summary_text", Text: "brief reasoning"}},
+	})
+
+	req, err := NewBackendRequestForTest(context.Background(), cfg, AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{
+				map[string]any{
+					"type":      "thinking",
+					"thinking":  "brief reasoning",
+					"signature": carrier,
+				},
+			}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+
+	if len(payload.Input) != 1 {
+		t.Fatalf("input item count = %d, want 1", len(payload.Input))
+	}
+	if payload.Input[0].Type != "reasoning" {
+		t.Fatalf("reasoning mapping incorrect: %#v", payload.Input[0])
+	}
+	if payload.Input[0].ID != "" {
+		t.Fatalf("reasoning item id should be dropped when encrypted_content is unavailable: %#v", payload.Input[0])
 	}
 }
 
@@ -7130,6 +7179,86 @@ func TestHandleMessagesRetriesWithoutReasoningIncludeAfterUnsupportedParameterIn
 	}
 	if _, ok := requests[1]["include"]; ok {
 		t.Fatalf("second request still has include: %#v", requests[1])
+	}
+}
+
+func TestHandleMessagesRetriesWithoutPersistedHistoryIDsAfterStatelessSessionError(t *testing.T) {
+	carrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:               "rs_legacy",
+		Type:             "reasoning",
+		EncryptedContent: "opaque-reasoning",
+		Summary:          []OpenAIReasoningPart{{Type: "summary_text", Text: "brief reasoning"}},
+	})
+	reqBody, err := json.Marshal(AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{
+				map[string]any{"type": "thinking", "thinking": "brief reasoning", "signature": carrier},
+				map[string]any{"type": "text", "text": "continuing"},
+			}},
+			{Role: "user", Content: "continue"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	var requests []map[string]any
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode backend request: %v", err)
+		}
+		requests = append(requests, body)
+
+		input, ok := body["input"].([]any)
+		if !ok || len(input) == 0 {
+			t.Fatalf("missing input payload: %#v", body)
+		}
+		firstItem, ok := input[0].(map[string]any)
+		if !ok {
+			t.Fatalf("first input item shape = %#v", input[0])
+		}
+		if store, ok := body["store"].(bool); !ok || !store {
+			t.Fatalf("store should be enabled on both attempts: %#v", body["store"])
+		}
+
+		if len(requests) == 1 {
+			if firstItem["id"] != "rs_legacy" {
+				t.Fatalf("first retry attempt should preserve original reasoning item id: %#v", firstItem)
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, "{\"error\":{\"code\":null,\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"message\\\": \\\"Item with id 'rs_legacy' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input.\\\",\\n    \\\"type\\\": \\\"invalid_request_error\\\",\\n    \\\"param\\\": \\\"input\\\",\\n    \\\"code\\\": null\\n  }\\n}（traceid: cf78a7283868a718343b4b489c043dac）\",\"param\":null,\"type\":\"invalid_request_error\"}}")
+			return
+		}
+
+		if _, ok := firstItem["id"]; ok {
+			t.Fatalf("second retry attempt should strip persisted reasoning ids after stateless-session failure: %#v", firstItem)
+		}
+		writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{
+			ID:     "resp_persistence_retry_ok",
+			Output: []OpenAIOutputItem{{Type: "message", Role: "assistant", Content: []OpenAIOutputContent{{Type: "output_text", Text: "ok"}}}},
+			Usage:  OpenAIUsage{InputTokens: 1, OutputTokens: 1},
+		})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(requests) != 2 {
+		t.Fatalf("backend request count = %d, want 2", len(requests))
 	}
 }
 

@@ -34,7 +34,108 @@
 - 代理**不会**再自动读取当前项目目录下的 `.claude/settings*.json` 作为后端 fallback，避免不可信仓库重定向请求目标
 - 仍然推荐显式设置 `CLAUDE_CODE_PROXY_BACKEND_MODEL`，这样不会受客户端展示模型名影响
 
-## 启动
+## Docker 分发与运行
+
+镜像可以被别人 clone 后本地构建，也可以发布到 GHCR / Docker Hub 后直接 `docker pull` 运行；但**后端 URL、后端 API key、客户端共享密钥不能写进 Dockerfile 或镜像**，必须由使用者在运行容器时通过环境变量或 env-file 注入。
+
+### 方式 A：克隆仓库后用 compose 构建运行
+
+PowerShell:
+
+```powershell
+git clone <your-repo-url>
+cd claude-code-proxy
+
+# 方式 1：从本机已有的 ~/.codex / ~/.claude 配置生成 .env.local
+# Windows PowerShell
+.\scripts\write-env-from-config.ps1
+
+# Linux
+# bash scripts/write-env-from-config.sh
+
+# macOS Terminal
+# bash scripts/write-env-from-config.sh
+
+# macOS Finder / double-click
+# open scripts/write-env-from-config.command
+
+# 方式 2：手动复制模板后填写
+# Copy-Item env.example .env.local
+# notepad .env.local
+
+docker compose --env-file .env.local up -d --build
+```
+
+### 方式 B：拉取已发布镜像后直接运行
+
+假设你把镜像发布为 `ghcr.io/YOUR_ORG/claude-codex-proxy:latest`：
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  -e CLAUDE_CODE_PROXY_BACKEND_BASE_URL="https://your-backend.example.com" `
+  -e CLAUDE_CODE_PROXY_BACKEND_API_KEY="your-backend-api-key" `
+  -e CLAUDE_CODE_PROXY_BACKEND_MODEL="gpt-5.4" `
+  -e CLAUDE_CODE_PROXY_CLIENT_API_KEY="replace-with-a-local-shared-key" `
+  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
+```
+
+如果你已经有 `.env.local`，也可以改用：
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  --env-file .env.local `
+  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
+```
+
+容器镜像默认监听：
+
+```text
+0.0.0.0:8787
+```
+
+因此 Docker 运行时必须设置：
+
+```dotenv
+CLAUDE_CODE_PROXY_CLIENT_API_KEY=...
+```
+
+Claude Code 侧使用同一个共享密钥：
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
+$env:ANTHROPIC_AUTH_TOKEN = "<同 CLAUDE_CODE_PROXY_CLIENT_API_KEY>"
+$env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
+```
+
+> 不能做到“公开镜像无需任何配置就能正常访问后端”，因为每个使用者的后端地址、API key、目标模型和客户端共享密钥都不同；把这些值提前复制进镜像会泄露密钥。
+
+如果使用者已经在本机配置过 Codex / Claude Code，也可以只克隆仓库后运行对应系统脚本：
+
+```powershell
+# Windows PowerShell
+.\scripts\write-env-from-config.ps1
+```
+
+```bash
+# Linux
+bash scripts/write-env-from-config.sh
+```
+
+```bash
+# macOS Terminal
+bash scripts/write-env-from-config.sh
+```
+
+```bash
+# macOS Finder / double-click
+open scripts/write-env-from-config.command
+```
+
+脚本会按代理相同的优先级读取当前环境变量、`~/.codex` 与 `~/.claude`，生成被 `.gitignore` 忽略的 `.env.local`。Windows PowerShell 覆盖已有文件用 `-Force`；Linux / macOS 覆盖已有文件用 `--force`。Linux / macOS 脚本依赖系统可用的 `python3`。macOS 的 `.command` 文件只是对 `write-env-from-config.sh` 的 Finder 友好包装；如果 Finder 提示没有执行权限，可先运行 `chmod +x scripts/write-env-from-config.command`。
+
+## 本地源码启动
 
 PowerShell:
 
@@ -46,7 +147,7 @@ $env:CLAUDE_CODE_PROXY_LISTEN_ADDR = "127.0.0.1:8787"
 # 非 loopback / 容器部署时，务必设置客户端共享密钥
 # $env:CLAUDE_CODE_PROXY_CLIENT_API_KEY = "<你的客户端 key>"
 
-go run ./cmd/claude-codex-proxy
+go run .
 ```
 
 可选环境变量：
@@ -73,7 +174,7 @@ go run ./cmd/claude-codex-proxy
 
 ```powershell
 $env:CLAUDE_CODE_PROXY_LISTEN_ADDR = "127.0.0.1:8787"
-go run ./cmd/claude-codex-proxy
+go run .
 ```
 
 说明：
