@@ -26,9 +26,11 @@ ENV HOME=/home/app \
 WORKDIR /app
 
 COPY --from=build /out/claude-codex-proxy /usr/local/bin/claude-codex-proxy
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 USER app:app
 
 EXPOSE 8787
 
-ENTRYPOINT ["claude-codex-proxy"]
+ENTRYPOINT ["docker-entrypoint.sh"]

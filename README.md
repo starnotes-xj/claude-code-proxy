@@ -36,82 +36,28 @@
 
 ## Docker 分发与运行
 
-镜像可以被别人 clone 后本地构建，也可以发布到 GHCR / Docker Hub 后直接 `docker pull` 运行；但**后端 URL、后端 API key、客户端共享密钥不能写进 Dockerfile 或镜像**，必须由使用者在运行容器时通过环境变量或 env-file 注入。
+说明：
 
-### 方式 A：克隆仓库后用 compose 构建运行
+- 不要把后端 URL、后端 API key、客户端共享密钥写进 Dockerfile、镜像或仓库。
+- 运行镜像时请把本地 `.env.local` 只读挂载到 `/app/.env.local`。
+- Docker 模式下容器内默认监听 `0.0.0.0:8787`，因此 `CLAUDE_CODE_PROXY_CLIENT_API_KEY` 应视为必填。
 
-PowerShell:
+镜像启动时会自动读取：
+
+```text
+/app/.env.local
+```
+
+### Quick Start
+
+#### 1. 准备配置文件
 
 ```powershell
 git clone <your-repo-url>
 cd claude-code-proxy
-
-# 方式 1：从本机已有的 ~/.codex / ~/.claude 配置生成 .env.local
-# Windows PowerShell
-.\scripts\write-env-from-config.ps1
-
-# Linux
-# bash scripts/write-env-from-config.sh
-
-# macOS Terminal
-# bash scripts/write-env-from-config.sh
-
-# macOS Finder / double-click
-# open scripts/write-env-from-config.command
-
-# 方式 2：手动复制模板后填写
-# Copy-Item env.example .env.local
-# notepad .env.local
-
-docker compose --env-file .env.local up -d --build
 ```
 
-### 方式 B：拉取已发布镜像后直接运行
-
-假设你把镜像发布为 `ghcr.io/YOUR_ORG/claude-codex-proxy:latest`：
-
-```powershell
-docker run --rm `
-  -p 127.0.0.1:8787:8787 `
-  -e CLAUDE_CODE_PROXY_BACKEND_BASE_URL="https://your-backend.example.com" `
-  -e CLAUDE_CODE_PROXY_BACKEND_API_KEY="your-backend-api-key" `
-  -e CLAUDE_CODE_PROXY_BACKEND_MODEL="gpt-5.4" `
-  -e CLAUDE_CODE_PROXY_CLIENT_API_KEY="replace-with-a-local-shared-key" `
-  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
-```
-
-如果你已经有 `.env.local`，也可以改用：
-
-```powershell
-docker run --rm `
-  -p 127.0.0.1:8787:8787 `
-  --env-file .env.local `
-  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
-```
-
-容器镜像默认监听：
-
-```text
-0.0.0.0:8787
-```
-
-因此 Docker 运行时必须设置：
-
-```dotenv
-CLAUDE_CODE_PROXY_CLIENT_API_KEY=...
-```
-
-Claude Code 侧使用同一个共享密钥：
-
-```powershell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
-$env:ANTHROPIC_AUTH_TOKEN = "<同 CLAUDE_CODE_PROXY_CLIENT_API_KEY>"
-$env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
-```
-
-> 不能做到“公开镜像无需任何配置就能正常访问后端”，因为每个使用者的后端地址、API key、目标模型和客户端共享密钥都不同；把这些值提前复制进镜像会泄露密钥。
-
-如果使用者已经在本机配置过 Codex / Claude Code，也可以只克隆仓库后运行对应系统脚本：
+方式 1：从本机已有的 `~/.codex` / `~/.claude` 配置生成 `.env.local`
 
 ```powershell
 # Windows PowerShell
@@ -133,24 +79,43 @@ bash scripts/write-env-from-config.sh
 open scripts/write-env-from-config.command
 ```
 
-脚本会按代理相同的优先级读取当前环境变量、`~/.codex` 与 `~/.claude`，生成被 `.gitignore` 忽略的 `.env.local`。Windows PowerShell 覆盖已有文件用 `-Force`；Linux / macOS 覆盖已有文件用 `--force`。Linux / macOS 脚本依赖系统可用的 `python3`。macOS 的 `.command` 文件只是对 `write-env-from-config.sh` 的 Finder 友好包装；如果 Finder 提示没有执行权限，可先运行 `chmod +x scripts/write-env-from-config.command`。
-
-## 本地源码启动
-
-PowerShell:
+方式 2：手动复制模板后填写
 
 ```powershell
-$env:CLAUDE_CODE_PROXY_BACKEND_API_KEY = "<你的后端 key>"
-$env:CLAUDE_CODE_PROXY_BACKEND_MODEL = "gpt-5-codex"
-$env:CLAUDE_CODE_PROXY_BACKEND_BASE_URL = "https://example.com"
-$env:CLAUDE_CODE_PROXY_LISTEN_ADDR = "127.0.0.1:8787"
-# 非 loopback / 容器部署时，务必设置客户端共享密钥
-# $env:CLAUDE_CODE_PROXY_CLIENT_API_KEY = "<你的客户端 key>"
-
-go run .
+Copy-Item env.example .env.local
+notepad .env.local
 ```
 
-可选环境变量：
+#### 2. 构建镜像
+
+```powershell
+docker build -t claude-codex-proxy:latest .
+```
+
+#### 3. 运行容器
+
+```powershell
+docker run --name claude-codex-proxy `
+  -p 127.0.0.1:8787:8787 `
+  -v "${PWD}/.env.local:/app/.env.local:ro" `
+  claude-codex-proxy:latest
+```
+
+你只需要把本地生成好的 `.env.local` 以只读方式挂载进去即可。如果同时使用 `-e` 传入环境变量，显式传入的环境变量优先。
+
+如果你更想直接传环境变量，也仍然可以改用：
+
+```powershell
+docker run --name claude-codex-proxy `
+  -p 127.0.0.1:8787:8787 `
+  -e CLAUDE_CODE_PROXY_BACKEND_BASE_URL="https://your-backend.example.com" `
+  -e CLAUDE_CODE_PROXY_BACKEND_API_KEY="your-backend-api-key" `
+  -e CLAUDE_CODE_PROXY_BACKEND_MODEL="gpt-5.4" `
+  -e CLAUDE_CODE_PROXY_CLIENT_API_KEY="replace-with-a-local-shared-key" `
+  claude-codex-proxy:latest
+```
+
+## 可选环境变量
 
 - `CLAUDE_CODE_PROXY_BACKEND_PATH`，默认 `/v1/responses`
 - `CLAUDE_CODE_PROXY_REQUEST_TIMEOUT`，默认 `120s`
@@ -170,41 +135,11 @@ go run .
 - `CLAUDE_CODE_PROXY_DISABLE_BACKEND_STREAMING=true`，强制后端走非流式
 - `CLAUDE_CODE_PROXY_DEBUG=true`，打印请求摘要与后端错误详情，便于排障
 
-如果你已经在 Codex / Claude Code 配置里填好了 URL 与 key，最小启动可以只保留监听地址：
-
-```powershell
-$env:CLAUDE_CODE_PROXY_LISTEN_ADDR = "127.0.0.1:8787"
-go run .
-```
-
 说明：
 
 - 本地 loopback 开发默认仍可不配 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
 - 如果监听地址是 `0.0.0.0`、`:` 前缀或其他非 loopback 地址，启动时必须设置 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
-- Docker / compose 本地运行请见 [`docs/docker-local.md`](docs/docker-local.md)。Docker 模式下容器内监听 `0.0.0.0:8787`、宿主机只绑定 `127.0.0.1:8787`，因此 `CLAUDE_CODE_PROXY_CLIENT_API_KEY` 应视为必填。
-
-## Claude Code 配置
-
-PowerShell:
-
-```powershell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
-# 如果代理配置了 CLAUDE_CODE_PROXY_CLIENT_API_KEY，这里应设置成相同的值
-$env:ANTHROPIC_AUTH_TOKEN = "proxy-client-key-or-placeholder"
-$env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
-```
-
-说明：
-
-- 如果代理启用了 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`，Claude Code 侧也要把 `ANTHROPIC_AUTH_TOKEN` 设成相同密钥
-- 代理同时接受 `Authorization: Bearer <key>` 和 `x-api-key: <key>`，这样既兼容本地开发，也兼容容器/远程部署
-- 如果代理仅监听 `127.0.0.1` 且你没有配置 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`，`ANTHROPIC_AUTH_TOKEN` 仍可使用占位值
-- 实际请求会使用 `CLAUDE_CODE_PROXY_BACKEND_API_KEY` 去访问后端
-- 代理默认把 Claude Code 请求里的 `model` 映射到 `CLAUDE_CODE_PROXY_BACKEND_MODEL`
-- 为兼容部分不接受 `metadata` 参数的 OpenAI-format 后端，代理默认**不**向后端发送 metadata；如确实需要，可显式开启 `CLAUDE_CODE_PROXY_ENABLE_BACKEND_METADATA=true`
-- 如果只想停止转发用户原始 `metadata`，优先使用 `CLAUDE_CODE_PROXY_FORWARD_USER_METADATA=false`
-- 如果希望彻底匿名外发，使用 `CLAUDE_CODE_PROXY_ANONYMOUS_MODE=true`；该模式会覆盖 allowlist / ForwardUserMetadata / continuity / prompt_cache_key 等外发路径，但不会关闭代理内部 continuity 派生逻辑
-- 已实测可用的后端模型名：`gpt-5.4`、`gpt-5.3-codex`
+- Docker 本地镜像运行请见 [`docs/docker-local.md`](docs/docker-local.md)。Docker 模式下容器内监听 `0.0.0.0:8787`、宿主机只绑定 `127.0.0.1:8787`，因此 `CLAUDE_CODE_PROXY_CLIENT_API_KEY` 应视为必填。
 
 ## 当前支持范围
 
@@ -248,6 +183,11 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 - 流式响应优先适配 OpenAI `/v1/responses` 风格 SSE 事件；若后端事件类型/字段明显偏离，仍需要再补兼容
   - SSE 单个 event 读取缓冲区上限为 2MB（Go `bufio.Scanner` 限制），超过会导致流解析失败
   - 非流式请求若后端返回流式响应，会先聚合完整事件流再转换（增加延迟与内存占用）
-  - 流式请求若后端不返回 SSE，会先接完整 JSON 再转成 Anthropic SSE（首 token 延迟更高）
+- 流式请求若后端不返回 SSE，会先接完整 JSON 再转成 Anthropic SSE（首 token 延迟更高）
 - 参数映射：`stop_sequences` 不转发到后端（后端不支持）
 - 本地合成的 `/v1/models` fallback 只广告单个模型；若后端原生支持模型列表透传，代理会优先返回后端提供的多模型数据
+
+## 参考与致谢
+
+- 本项目的部分功能设计与代码实现参考了 [caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api)
+- 感谢 [caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api) 项目提供的功能思路与实现参考

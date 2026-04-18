@@ -6,8 +6,8 @@
 
 - 宿主机只开放 `127.0.0.1:8787`
 - 容器内监听 `0.0.0.0:8787`
-- 默认通过 `docker compose --env-file .env.local` / 环境变量配置
-- 默认**不**挂载源码、`~/.codex`、`~/.claude`
+- 默认通过 Dockerfile 构建镜像，再用 `docker run` 运行
+- 默认只读挂载 `.env.local`，不挂源码、`~/.codex`、`~/.claude`
 
 > 为什么容器里要监听 `0.0.0.0`？
 >
@@ -16,6 +16,8 @@
 ## 1. 准备 `.env.local`
 
 如果你本机已经配置过 Codex / Claude Code，可以直接从本机配置生成 `.env.local`。
+
+方式 1：从本机已有配置生成 `.env.local`
 
 Windows PowerShell：
 
@@ -65,7 +67,7 @@ open scripts/write-env-from-config.command
 bash scripts/write-env-from-config.sh --force
 ```
 
-也可以手动复制示例配置并填入真实值：
+方式 2：手动复制示例配置并填入真实值
 
 ```powershell
 Copy-Item env.example .env.local
@@ -97,17 +99,47 @@ CLAUDE_CODE_PROXY_CLIENT_API_KEY=replace-with-a-local-shared-key
 说明：
 
 - `env.example` 可以提交到远程仓库，`.env.local` 不应提交
-- `compose.yaml` 通过 `docker compose --env-file .env.local ...` 读取这份配置
+- Docker 方案推荐把 `.env.local` 以只读挂载方式映射到容器内 `/app/.env.local`
 - 也可以直接在 shell 里临时导出环境变量
 - 默认方案不依赖 `~/.codex` / `~/.claude` 的自动发现逻辑
 
-## 2. 构建并启动
+## 2. Quick Start
+
+### 2.1 Build image
 
 ```powershell
-docker compose --env-file .env.local up -d --build
+docker build -t claude-codex-proxy:latest .
 ```
 
+### 2.2 Run container
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  -v "${PWD}/.env.local:/app/.env.local:ro" `
+  claude-codex-proxy:latest
+```
+
+### 2.3 Run published image
+
 如果你已经从远程镜像仓库拉取了镜像，也可以不克隆源码，直接运行：
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  -v "${PWD}/.env.local:/app/.env.local:ro" `
+  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
+```
+
+镜像启动时会自动读取：
+
+```text
+/app/.env.local
+```
+
+所以只要把本地 `.env.local` 以只读方式挂载进去即可。
+
+如果你更想直接传环境变量，则可以使用：
 
 ```powershell
 docker run --rm `
@@ -119,27 +151,18 @@ docker run --rm `
   ghcr.io/YOUR_ORG/claude-codex-proxy:latest
 ```
 
-如果你已经准备好了 `.env.local`，则可以使用：
-
-```powershell
-docker run --rm `
-  -p 127.0.0.1:8787:8787 `
-  --env-file .env.local `
-  ghcr.io/YOUR_ORG/claude-codex-proxy:latest
-```
-
-镜像内默认 `CLAUDE_CODE_PROXY_LISTEN_ADDR=0.0.0.0:8787`，因此 `docker run` 通常不需要额外设置监听地址。
+镜像内默认 `CLAUDE_CODE_PROXY_LISTEN_ADDR=0.0.0.0:8787`，因此 `docker run` 通常不需要额外设置监听地址。若同时使用 `-e` 和挂载的 `/app/.env.local`，显式传入的环境变量优先。
 
 查看日志：
 
 ```powershell
-docker compose logs -f proxy
+docker logs -f <container-id-or-name>
 ```
 
-停止：
+停止示例：
 
 ```powershell
-docker compose down
+docker stop <container-id-or-name>
 ```
 
 ## 3. 健康检查
@@ -168,13 +191,13 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
 其中：
 
-- `ANTHROPIC_BASE_URL` 指向 compose 暴露给宿主机的地址
+- `ANTHROPIC_BASE_URL` 指向 `docker run -p 127.0.0.1:8787:8787` 暴露给宿主机的地址
 - `ANTHROPIC_AUTH_TOKEN` 要与 `CLAUDE_CODE_PROXY_CLIENT_API_KEY` 保持一致
 - `ANTHROPIC_MODEL` 是 Claude Code 侧展示/请求的模型名，不必和后端真实模型名完全一致
 
 ## 5. 默认安全设计
 
-当前 Docker / compose 方案刻意做了这些限制：
+当前 Docker 镜像运行方案刻意做了这些限制：
 
 - **宿主机绑定**：`127.0.0.1:8787:8787`
   - 这样默认只允许本机访问，不直接暴露到局域网
@@ -185,7 +208,8 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 - **不把个人配置或密钥打进镜像**
   - 远程仓库 / 公开镜像只包含程序本体
   - 后端 URL、后端 API key、客户端共享密钥都在运行时通过 env-file 或环境变量注入
-- **默认无 volume**
+- **默认最小挂载**
+  - 只读挂载 `.env.local -> /app/.env.local`
   - 不挂源码
   - 不挂 home 目录
   - 不依赖宿主本地配置目录
@@ -197,16 +221,22 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
 ## 6. 什么时候需要额外挂载
 
-默认情况下**不需要任何挂载**。
+默认情况下至少需要一个只读挂载：
 
-如果你确实想复用宿主机已有的 `~/.codex` 或 `~/.claude` 配置，可以自行在 compose 里增加**只读挂载**，例如：
+```powershell
+-v "${PWD}/.env.local:/app/.env.local:ro"
+```
 
-```yaml
-services:
-  proxy:
-    volumes:
-      - ${USERPROFILE}/.codex:/home/app/.codex:ro
-      - ${USERPROFILE}/.claude:/home/app/.claude:ro
+这个挂载只用于把运行时配置注入镜像，不会把源码或 home 配置目录暴露给容器。
+
+如果你确实还想复用宿主机已有的 `~/.codex` 或 `~/.claude` 配置，可以在 `docker run` 时额外增加**只读挂载**，例如：
+
+```powershell
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  -v "${USERPROFILE}\\.codex:/home/app/.codex:ro" `
+  -v "${USERPROFILE}\\.claude:/home/app/.claude:ro" `
+  claude-codex-proxy:latest
 ```
 
 但这不属于默认推荐路径，因为：
@@ -227,7 +257,11 @@ services:
 补齐后重新执行：
 
 ```powershell
-docker compose --env-file .env.local up -d --build
+docker build -t claude-codex-proxy:latest .
+docker run --rm `
+  -p 127.0.0.1:8787:8787 `
+  -v "${PWD}/.env.local:/app/.env.local:ro" `
+  claude-codex-proxy:latest
 ```
 
 ### 启动时报 missing client API key
@@ -252,8 +286,8 @@ docker compose --env-file .env.local up -d --build
 
 优先检查：
 
-1. `docker compose ps`
-2. `docker compose logs proxy`
+1. `docker ps -a`
+2. `docker logs <container-id-or-name>`
 3. 是否已有别的程序占用了宿主机 `8787` 端口
 
 ### HTTPS 后端访问失败
