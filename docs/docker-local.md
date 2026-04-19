@@ -111,10 +111,21 @@ CLAUDE_CODE_PROXY_CLIENT_API_KEY=replace-with-a-local-shared-key
 docker build -t claude-codex-proxy:latest .
 ```
 
+默认基础镜像使用 `public.ecr.aws/docker/library/golang:1.25.7-alpine3.22` 和 `public.ecr.aws/docker/library/alpine:3.22`，用于绕开部分本地 Docker 守护进程中失效的 `docker.io` mirror 配置。
+
+如果你需要显式覆盖基础镜像：
+
+```powershell
+docker build `
+  --build-arg GO_IMAGE=public.ecr.aws/docker/library/golang:1.25.7-alpine3.22 `
+  --build-arg RUNTIME_IMAGE=public.ecr.aws/docker/library/alpine:3.22 `
+  -t claude-codex-proxy:latest .
+```
+
 ### 2.2 Run container
 
 ```powershell
-docker run --rm `
+docker run -d --rm `
   -p 127.0.0.1:8787:8787 `
   -v "${PWD}/.env.local:/app/.env.local:ro" `
   claude-codex-proxy:latest
@@ -125,7 +136,7 @@ docker run --rm `
 如果你已经从远程镜像仓库拉取了镜像，也可以不克隆源码，直接运行：
 
 ```powershell
-docker run --rm `
+docker run -d --rm `
   -p 127.0.0.1:8787:8787 `
   -v "${PWD}/.env.local:/app/.env.local:ro" `
   ghcr.io/YOUR_ORG/claude-codex-proxy:latest
@@ -142,7 +153,7 @@ docker run --rm `
 如果你更想直接传环境变量，则可以使用：
 
 ```powershell
-docker run --rm `
+docker run -d --rm `
   -p 127.0.0.1:8787:8787 `
   -e CLAUDE_CODE_PROXY_BACKEND_BASE_URL="https://your-backend.example.com" `
   -e CLAUDE_CODE_PROXY_BACKEND_API_KEY="your-backend-api-key" `
@@ -232,7 +243,7 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 如果你确实还想复用宿主机已有的 `~/.codex` 或 `~/.claude` 配置，可以在 `docker run` 时额外增加**只读挂载**，例如：
 
 ```powershell
-docker run --rm `
+docker run -d --rm `
   -p 127.0.0.1:8787:8787 `
   -v "${USERPROFILE}\\.codex:/home/app/.codex:ro" `
   -v "${USERPROFILE}\\.claude:/home/app/.claude:ro" `
@@ -258,10 +269,34 @@ docker run --rm `
 
 ```powershell
 docker build -t claude-codex-proxy:latest .
-docker run --rm `
+docker run -d --rm `
   -p 127.0.0.1:8787:8787 `
   -v "${PWD}/.env.local:/app/.env.local:ro" `
   claude-codex-proxy:latest
+```
+
+### 构建时报 `docker.io/library/*` mirror 403
+
+如果你看到类似：
+
+- `failed to resolve source metadata for docker.io/library/alpine:3.22`
+- `unexpected status from HEAD request to ... mirror.aliyuncs.com ... 403 Forbidden`
+
+说明失败点在本机 Docker 守护进程配置的 Docker Hub mirror，不在应用代码。当前仓库默认已经把基础镜像切到 `public.ecr.aws/docker/library/*`；如果本机仍报这个错，通常意味着你正在构建旧版本工作树、旧缓存上下文，或者其他脚本里还写死了 `docker.io` 基础镜像。
+
+可先直接重试当前仓库版本：
+
+```powershell
+docker build --no-cache -t claude-codex-proxy:latest .
+```
+
+如果你需要显式指定：
+
+```powershell
+docker build `
+  --build-arg GO_IMAGE=public.ecr.aws/docker/library/golang:1.25.7-alpine3.22 `
+  --build-arg RUNTIME_IMAGE=public.ecr.aws/docker/library/alpine:3.22 `
+  -t claude-codex-proxy:latest .
 ```
 
 ### 启动时报 missing client API key

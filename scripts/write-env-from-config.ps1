@@ -64,8 +64,8 @@ function Test-LoopbackUrl {
         return $false
     }
 
-    $host = ($uri.Host + "").Trim().ToLowerInvariant()
-    return $host -eq "localhost" -or $host -eq "127.0.0.1" -or $host -eq "::1"
+    $hostName = ($uri.Host + "").Trim().ToLowerInvariant()
+    return $hostName -eq "localhost" -or $hostName -eq "127.0.0.1" -or $hostName -eq "::1"
 }
 
 function Remove-TomlInlineComment {
@@ -103,6 +103,31 @@ function Unquote-TomlValue {
         }
     }
     return $value.Trim()
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [object]$InputObject,
+        [string]$Name
+    )
+
+    if ($null -eq $InputObject -or [string]::IsNullOrWhiteSpace($Name)) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) {
+            return $InputObject[$Name]
+        }
+        return $null
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
 }
 
 function Read-CodexConfig {
@@ -199,8 +224,9 @@ function Read-CodexConfig {
     if (Test-Path -LiteralPath $authPath) {
         try {
             $auth = Get-Content -Raw -LiteralPath $authPath | ConvertFrom-Json
-            if ($null -ne $auth.OPENAI_API_KEY) {
-                $result.BackendAPIKey = ($auth.OPENAI_API_KEY + "").Trim()
+            $openAIAPIKey = Get-ObjectPropertyValue -InputObject $auth -Name "OPENAI_API_KEY"
+            if ($null -ne $openAIAPIKey) {
+                $result.BackendAPIKey = ($openAIAPIKey + "").Trim()
             }
         } catch {
             Write-Warning "Failed to parse Codex auth file: $authPath"
@@ -235,18 +261,19 @@ function Read-ClaudeConfig {
             continue
         }
 
-        if ($null -eq $settings.env) {
+        $envSettings = Get-ObjectPropertyValue -InputObject $settings -Name "env"
+        if ($null -eq $envSettings) {
             continue
         }
 
-        $baseURL = Normalize-BackendBaseUrl ($settings.env.ANTHROPIC_BASE_URL + "")
+        $baseURL = Normalize-BackendBaseUrl ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_BASE_URL") + "")
         if (Test-LoopbackUrl $baseURL) {
             continue
         }
 
         $result.BackendBaseURL = First-NonEmpty $result.BackendBaseURL $baseURL
-        $result.BackendAPIKey = First-NonEmpty $result.BackendAPIKey ($settings.env.ANTHROPIC_AUTH_TOKEN + "")
-        $result.BackendModel = First-NonEmpty $result.BackendModel ($settings.env.ANTHROPIC_MODEL + "")
+        $result.BackendAPIKey = First-NonEmpty $result.BackendAPIKey ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_AUTH_TOKEN") + "")
+        $result.BackendModel = First-NonEmpty $result.BackendModel ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_MODEL") + "")
     }
 
     return $result

@@ -95,7 +95,7 @@ docker build -t claude-codex-proxy:latest .
 #### 3. 运行容器
 
 ```powershell
-docker run --name claude-codex-proxy `
+docker run -d --name claude-codex-proxy `
   -p 127.0.0.1:8787:8787 `
   -v "${PWD}/.env.local:/app/.env.local:ro" `
   claude-codex-proxy:latest
@@ -106,7 +106,7 @@ docker run --name claude-codex-proxy `
 如果你更想直接传环境变量，也仍然可以改用：
 
 ```powershell
-docker run --name claude-codex-proxy `
+docker run -d --name claude-codex-proxy `
   -p 127.0.0.1:8787:8787 `
   -e CLAUDE_CODE_PROXY_BACKEND_BASE_URL="https://your-backend.example.com" `
   -e CLAUDE_CODE_PROXY_BACKEND_API_KEY="your-backend-api-key" `
