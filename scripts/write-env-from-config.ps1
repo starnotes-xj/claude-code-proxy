@@ -243,6 +243,7 @@ function Read-ClaudeConfig {
         BackendBaseURL = ""
         BackendModel = ""
         BackendAPIKey = ""
+        ClientAPIKey = ""
     }
 
     $paths = @(
@@ -266,13 +267,15 @@ function Read-ClaudeConfig {
             continue
         }
 
+        $authToken = ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_AUTH_TOKEN") + "").Trim()
         $baseURL = Normalize-BackendBaseUrl ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_BASE_URL") + "")
         if (Test-LoopbackUrl $baseURL) {
+            $result.ClientAPIKey = First-NonEmpty $result.ClientAPIKey $authToken
             continue
         }
 
         $result.BackendBaseURL = First-NonEmpty $result.BackendBaseURL $baseURL
-        $result.BackendAPIKey = First-NonEmpty $result.BackendAPIKey ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_AUTH_TOKEN") + "")
+        $result.BackendAPIKey = First-NonEmpty $result.BackendAPIKey $authToken
         $result.BackendModel = First-NonEmpty $result.BackendModel ((Get-ObjectPropertyValue -InputObject $envSettings -Name "ANTHROPIC_MODEL") + "")
     }
 
@@ -305,7 +308,7 @@ $claude = Read-ClaudeConfig $HomeDir
 $backendBaseURL = First-NonEmpty $env:CLAUDE_CODE_PROXY_BACKEND_BASE_URL $codex.BackendBaseURL $claude.BackendBaseURL
 $backendAPIKey = First-NonEmpty $env:CLAUDE_CODE_PROXY_BACKEND_API_KEY $codex.BackendAPIKey $claude.BackendAPIKey
 $backendModel = First-NonEmpty $env:CLAUDE_CODE_PROXY_BACKEND_MODEL $codex.BackendModel $claude.BackendModel "gpt-5.4"
-$clientAPIKey = First-NonEmpty $env:CLAUDE_CODE_PROXY_CLIENT_API_KEY
+$clientAPIKey = First-NonEmpty $env:CLAUDE_CODE_PROXY_CLIENT_API_KEY $claude.ClientAPIKey
 
 if ($clientAPIKey -eq "" -and -not $NoGenerateClientKey) {
     $clientAPIKey = New-RandomToken

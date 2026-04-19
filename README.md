@@ -22,15 +22,19 @@
   - Claude Code: `env.ANTHROPIC_BASE_URL`
 - backend API key
   - Codex: `auth.json` 里的 `OPENAI_API_KEY`
-  - Claude Code: `env.ANTHROPIC_AUTH_TOKEN`
+  - Claude Code: 当 `env.ANTHROPIC_BASE_URL` 是非 loopback 后端地址时，读取 `env.ANTHROPIC_AUTH_TOKEN`
 - backend model
   - Codex: 顶层 `model`
   - Claude Code: `env.ANTHROPIC_MODEL`
+- client API key
+  - 显式环境变量：`CLAUDE_CODE_PROXY_CLIENT_API_KEY`
+  - Claude Code: 当 `env.ANTHROPIC_BASE_URL` 指向 `127.0.0.1` / `localhost` 之类的本地代理地址时，读取 `env.ANTHROPIC_AUTH_TOKEN`
 
 说明：
 
 - 如果 Claude Code 配置的是 Anthropic 风格地址（例如以 `/anthropic` 结尾），代理会自动归一化成 Responses 后端 base URL
 - 如果 Claude Code 配置指向的是本地代理地址（如 `127.0.0.1` / `localhost`），代理会自动忽略这类值，避免回环请求
+- 如果 Claude Code 当前已经指向本地代理地址，生成脚本会复用其中的 `ANTHROPIC_AUTH_TOKEN` 作为 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`
 - 代理**不会**再自动读取当前项目目录下的 `.claude/settings*.json` 作为后端 fallback，避免不可信仓库重定向请求目标
 - 仍然推荐显式设置 `CLAUDE_CODE_PROXY_BACKEND_MODEL`，这样不会受客户端展示模型名影响
 

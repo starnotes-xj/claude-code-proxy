@@ -187,6 +187,7 @@ def read_claude_config(home: Path) -> dict:
         "BackendBaseURL": "",
         "BackendModel": "",
         "BackendAPIKey": "",
+        "ClientAPIKey": "",
     }
 
     for path in (home / ".claude" / "settings.local.json", home / ".claude" / "settings.json"):
@@ -197,12 +198,14 @@ def read_claude_config(home: Path) -> dict:
         if not isinstance(env, dict):
             continue
 
+        auth_token = str(env.get("ANTHROPIC_AUTH_TOKEN", "")).strip()
         base_url = normalize_backend_base_url(str(env.get("ANTHROPIC_BASE_URL", "")))
         if is_loopback_url(base_url):
+            result["ClientAPIKey"] = first_non_empty(result["ClientAPIKey"], auth_token)
             continue
 
         result["BackendBaseURL"] = first_non_empty(result["BackendBaseURL"], base_url)
-        result["BackendAPIKey"] = first_non_empty(result["BackendAPIKey"], str(env.get("ANTHROPIC_AUTH_TOKEN", "")))
+        result["BackendAPIKey"] = first_non_empty(result["BackendAPIKey"], auth_token)
         result["BackendModel"] = first_non_empty(result["BackendModel"], str(env.get("ANTHROPIC_MODEL", "")))
 
     return result
@@ -237,7 +240,7 @@ def main() -> int:
     backend_base_url = first_non_empty(os.environ.get("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", ""), codex["BackendBaseURL"], claude["BackendBaseURL"])
     backend_api_key = first_non_empty(os.environ.get("CLAUDE_CODE_PROXY_BACKEND_API_KEY", ""), codex["BackendAPIKey"], claude["BackendAPIKey"])
     backend_model = first_non_empty(os.environ.get("CLAUDE_CODE_PROXY_BACKEND_MODEL", ""), codex["BackendModel"], claude["BackendModel"], "gpt-5.4")
-    client_api_key = first_non_empty(os.environ.get("CLAUDE_CODE_PROXY_CLIENT_API_KEY", ""))
+    client_api_key = first_non_empty(os.environ.get("CLAUDE_CODE_PROXY_CLIENT_API_KEY", ""), claude["ClientAPIKey"])
     if not client_api_key and not args.no_generate_client_key:
         client_api_key = secrets.token_urlsafe(32)
 

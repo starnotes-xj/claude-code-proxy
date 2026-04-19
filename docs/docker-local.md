@@ -57,6 +57,13 @@ open scripts/write-env-from-config.command
 .env.local
 ```
 
+如果你当前本地 Claude Code 已经配置为访问这个代理，例如：
+
+- `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
+- `ANTHROPIC_AUTH_TOKEN=<your-local-shared-key>`
+
+那么脚本会直接复用这个 `ANTHROPIC_AUTH_TOKEN` 作为生成后的 `CLAUDE_CODE_PROXY_CLIENT_API_KEY`，不会再随机生成一个不同的值。
+
 如果 `.env.local` 已存在，脚本默认不会覆盖；确认要覆盖时使用：
 
 ```powershell
