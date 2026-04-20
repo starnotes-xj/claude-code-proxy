@@ -3270,6 +3270,52 @@ func TestHandleMessagesNonStreamAggregatesContentPartAddedText(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesNonStreamAggregatesReasoningContentPartText(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_item.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.content_part.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.content_part.added\",\"item_id\":\"rs_1\",\"content_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"reasoning from added\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque-state\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		BackendModel:   "gpt-5.4",
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	var response AnthropicMessageResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode anthropic response: %v", err)
+	}
+	if len(response.Content) != 1 || response.Content[0].Type != "thinking" || response.Content[0].Thinking != "reasoning from added" {
+		t.Fatalf("aggregated reasoning content incorrect: %#v", response.Content)
+	}
+	if !strings.HasPrefix(response.Content[0].Signature, opaqueReasoningPrefix) {
+		t.Fatalf("reasoning signature missing: %#v", response.Content[0])
+	}
+}
+
 func TestHandleMessagesStreamTranslatesSSE(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -3529,6 +3575,68 @@ func TestHandleMessagesStreamDoesNotDuplicateInitialToolArgumentsWhenDoneRepeats
 	}
 }
 
+func TestHandleMessagesStreamAllowsLateOutputItemAddedArgumentsAfterToolClosed(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_item.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"ToolSearch\",\"call_id\":\"toolu_1\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.delta\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"query\\\":\\\"ct\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"query\\\":\\\"ctf\\\"}\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"ToolSearch\",\"call_id\":\"toolu_1\",\"arguments\":\"{\\\"query\\\":\\\"ctf\\\"}\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("late output_item.added arguments after close should be tolerated\n%s", body)
+	}
+	if got := strings.Count(body, "\"type\":\"input_json_delta\""); got != 2 {
+		t.Fatalf("input_json_delta count = %d, want 2 without duplicate late add\n%s", got, body)
+	}
+}
+
+func TestHandleMessagesStreamAllowsLateOutputItemDoneArgumentsAfterToolClosed(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_item.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"ToolSearch\",\"call_id\":\"toolu_1\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.delta\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"query\\\":\\\"ct\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"query\\\":\\\"ctf\\\"}\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_item.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"ToolSearch\",\"call_id\":\"toolu_1\",\"arguments\":\"{\\\"query\\\":\\\"ctf\\\"}\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("late output_item.done arguments after close should be tolerated\n%s", body)
+	}
+	if got := strings.Count(body, "\"type\":\"input_json_delta\""); got != 2 {
+		t.Fatalf("input_json_delta count = %d, want 2 without duplicate late done\n%s", got, body)
+	}
+}
+
 func TestHandleMessagesStreamLeavesNonToolOutputItemAddedUnaffected(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -3684,6 +3792,29 @@ func TestHandleMessagesStreamRejectsWhitespaceFloodInFunctionCallArguments(t *te
 	body := recorder.Body.String()
 	if !strings.Contains(body, "event: error") || !strings.Contains(body, "excessive whitespace in function_call_arguments.delta") {
 		t.Fatalf("whitespace flood not rejected\n%s", body)
+	}
+}
+
+func TestHandleMessagesStreamEmitsWhitespaceOnlySnapshotExtension(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.content_part.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"hello\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.content_part.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.content_part.done\",\"item_id\":\"msg_1\",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"hello \"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"text":"hello"`) || !strings.Contains(body, `"text":" "`) {
+		t.Fatalf("whitespace-only snapshot extension should be preserved\n%s", body)
 	}
 }
 
@@ -4183,6 +4314,254 @@ func TestHandleMessagesUsesModelProfilesToAvoidFirstUnsupportedRetry(t *testing.
 	output := body["input"].([]any)[1].(map[string]any)["output"]
 	if _, ok := output.(string); !ok {
 		t.Fatalf("structured output should be flattened by model profile: %#v", output)
+	}
+}
+
+func TestHandleMessagesUsesResponsesFamilyPresetToPreDisableBridgeExtensions(t *testing.T) {
+	type captured struct {
+		Path string
+		Body map[string]any
+	}
+	var requests []captured
+	reasoningCarrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:               "rs_1",
+		Type:             "reasoning",
+		EncryptedContent: "opaque-reasoning",
+	})
+	compactionCarrier := encodeCompactionCarrier("cmp_1", "opaque-compaction")
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			requests = append(requests, captured{Path: r.URL.Path})
+			writeJSONWithStatus(w, http.StatusOK, map[string]any{
+				"object": "list",
+				"data": []map[string]any{
+					{
+						"id":                  "gpt-5.4",
+						"vendor":              "openai",
+						"supported_endpoints": []string{"/responses"},
+						"capabilities": map[string]any{
+							"family": "gpt-5",
+						},
+					},
+				},
+			})
+		case "/v1/responses":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode backend request: %v", err)
+			}
+			requests = append(requests, captured{Path: r.URL.Path, Body: body})
+			writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{
+				ID:     "resp_family_preset_ok",
+				Output: []OpenAIOutputItem{{Type: "message", Role: "assistant", Content: []OpenAIOutputContent{{Type: "output_text", Text: "ok"}}}},
+				Usage:  OpenAIUsage{InputTokens: 1, OutputTokens: 1},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL:            backend.URL,
+		BackendPath:               "/v1/responses",
+		BackendAPIKey:             "rawchat-key",
+		BackendModel:              "gpt-5.4",
+		EnableModelCapabilityInit: true,
+		EnablePhaseCommentary:     true,
+	})
+
+	bodyBytes, err := json.Marshal(AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{
+				map[string]any{"type": "text", "text": "I will inspect this."},
+				map[string]any{"type": "thinking", "thinking": "brief reasoning", "signature": reasoningCarrier},
+				map[string]any{"type": "thinking", "thinking": defaultThinkingText, "signature": compactionCarrier},
+				map[string]any{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": map[string]any{"file_path": "README.md"}},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal anthropic request: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(bodyBytes))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Claude-Code-Session-Id", "session-1")
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2 (models + single responses request)", len(requests))
+	}
+	body := requests[1].Body
+	if _, ok := body["prompt_cache_key"]; ok {
+		t.Fatalf("prompt_cache_key should be pre-disabled by responses preset: %#v", body)
+	}
+	if _, ok := body["include"]; ok {
+		t.Fatalf("reasoning include should be pre-disabled by responses preset: %#v", body)
+	}
+	if _, ok := body["context_management"]; ok {
+		t.Fatalf("context_management should be pre-disabled by responses preset: %#v", body)
+	}
+	input := body["input"].([]any)
+	hasCompaction := false
+	hasPhase := false
+	for _, item := range input {
+		typed := item.(map[string]any)
+		if typed["type"] == "compaction" {
+			hasCompaction = true
+		}
+		if phase, ok := typed["phase"].(string); ok && phase != "" {
+			hasPhase = true
+		}
+	}
+	if hasCompaction {
+		t.Fatalf("compaction input should be pre-disabled by responses preset: %#v", input)
+	}
+	if hasPhase {
+		t.Fatalf("phase should be pre-disabled by responses preset: %#v", input)
+	}
+}
+
+func TestHandleMessagesResponsesFamilyPresetAllowsPeriodicProbe(t *testing.T) {
+	currentTime := time.Date(2026, 4, 20, 20, 0, 0, 0, time.UTC)
+	type captured struct{ Body map[string]any }
+	var requests []captured
+	reasoningCarrier := encodeReasoningCarrier(OpenAIOutputItem{ID: "rs_1", Type: "reasoning", EncryptedContent: "opaque-reasoning"})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode backend request: %v", err)
+			}
+			requests = append(requests, captured{Body: body})
+			writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{ID: "resp_ok", Output: []OpenAIOutputItem{{Type: "message", Role: "assistant", Content: []OpenAIOutputContent{{Type: "output_text", Text: "ok"}}}}, Usage: OpenAIUsage{InputTokens: 1, OutputTokens: 1}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key", BackendModel: "gpt-5.4", EnableModelCapabilityInit: true, CapabilityReprobeTTL: 30 * time.Minute})
+	proxy.now = func() time.Time { return currentTime }
+	proxy.seedCapabilitiesFromModels([]map[string]any{
+		normalizeModelDescriptor(map[string]any{
+			"id":                  "gpt-5.4",
+			"vendor":              "openai",
+			"supported_endpoints": []string{"/responses"},
+			"capabilities":        map[string]any{"family": "gpt-5"},
+		}),
+	})
+
+	makeReq := func() {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"thinking","thinking":"brief reasoning","signature":"`+reasoningCarrier+`"}]},{"role":"user","content":"continue"}]}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Claude-Code-Session-Id", "session-1")
+		proxy.Handler().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	makeReq()
+	makeReq()
+	currentTime = currentTime.Add(31 * time.Minute)
+	makeReq()
+	if len(requests) != 3 {
+		t.Fatalf("request count = %d, want 3", len(requests))
+	}
+	if _, ok := requests[0].Body["include"]; ok {
+		t.Fatalf("first request should honor preset disable: %#v", requests[0].Body)
+	}
+	if _, ok := requests[1].Body["include"]; ok {
+		t.Fatalf("second request within TTL should still honor preset disable: %#v", requests[1].Body)
+	}
+	if _, ok := requests[2].Body["include"]; !ok {
+		t.Fatalf("third request after TTL should reprobe reasoning include: %#v", requests[2].Body)
+	}
+}
+
+func TestBuildBackendRequestDoesNotApplyResponsesPresetForMixedEndpointFamily(t *testing.T) {
+	proxy := New(Config{
+		BackendBaseURL:            "https://example.com/codex",
+		BackendPath:               "/v1/responses",
+		BackendAPIKey:             "test-key",
+		BackendModel:              "gpt-5.4",
+		EnableModelCapabilityInit: true,
+		EnablePhaseCommentary:     true,
+	})
+
+	proxy.seedCapabilitiesFromModels([]map[string]any{
+		normalizeModelDescriptor(map[string]any{
+			"id":                  "gpt-5.4",
+			"vendor":              "openai",
+			"supported_endpoints": []string{"/responses", "/v1/messages"},
+			"capabilities": map[string]any{
+				"family":   "gpt-5",
+				"supports": map[string]any{},
+				"limits": map[string]any{
+					"max_prompt_tokens": 10000,
+				},
+			},
+		}),
+	})
+
+	reasoningCarrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:               "rs_1",
+		Type:             "reasoning",
+		EncryptedContent: "opaque-reasoning",
+	})
+	compactionCarrier := encodeCompactionCarrier("cmp_1", "opaque-compaction")
+	req, err := proxy.buildBackendRequest(context.Background(), AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{
+				map[string]any{"type": "text", "text": "I will inspect this."},
+				map[string]any{"type": "thinking", "thinking": "brief reasoning", "signature": reasoningCarrier},
+				map[string]any{"type": "thinking", "thinking": defaultThinkingText, "signature": compactionCarrier},
+				map[string]any{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": map[string]any{"file_path": "README.md"}},
+			}},
+			{Role: "user", Content: []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"},
+			}},
+		},
+	}, http.Header{"X-Claude-Code-Session-Id": []string{"session-1"}})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+	if payload.PromptCacheKey != "session-1" {
+		t.Fatalf("prompt_cache_key = %q, want session-1 when endpoint family is mixed", payload.PromptCacheKey)
+	}
+	if len(payload.Include) != 1 || payload.Include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("reasoning include should remain enabled for mixed endpoint family: %#v", payload.Include)
+	}
+	if len(payload.ContextManagement) != 1 || payload.ContextManagement[0].Type != "compaction" {
+		t.Fatalf("context_management should remain enabled for mixed endpoint family: %#v", payload.ContextManagement)
+	}
+	hasCompaction := false
+	for _, item := range payload.Input {
+		if item.Type == "compaction" {
+			hasCompaction = true
+		}
+	}
+	if !hasCompaction {
+		t.Fatalf("compaction input should remain enabled for mixed endpoint family: %#v", payload.Input)
 	}
 }
 
@@ -5786,6 +6165,116 @@ func TestBuildBackendRequestDoesNotUseWarmupModelForOrdinaryRequests(t *testing.
 	}
 }
 
+func TestBuildBackendRequestDoesNotUseWarmupModelForMultiTurnTextHistory(t *testing.T) {
+	cfg := Config{
+		BackendBaseURL:     "https://example.com/codex",
+		BackendPath:        "/v1/responses",
+		BackendAPIKey:      "test-key",
+		BackendWarmupModel: "gpt-5.4-mini",
+	}
+
+	req, err := NewBackendRequestForTest(context.Background(), cfg, AnthropicMessagesRequest{
+		Model: "gpt-5.4",
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: "first turn"},
+			{Role: "assistant", Content: "ack"},
+			{Role: "user", Content: "follow up"},
+		},
+	}, http.Header{"anthropic-beta": []string{"client-tools-2025-01-01"}})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+	if payload.Model != "gpt-5.4" {
+		t.Fatalf("multi-turn text request should stay on main model, got %q", payload.Model)
+	}
+}
+
+func TestBuildBackendRequestDoesNotUseWarmupModelWhenCompactionCarrierPresent(t *testing.T) {
+	cfg := Config{
+		BackendBaseURL:     "https://example.com/codex",
+		BackendPath:        "/v1/responses",
+		BackendAPIKey:      "test-key",
+		BackendWarmupModel: "gpt-5.4-mini",
+	}
+	carrier := encodeCompactionCarrier("cmp_1", "opaque-compaction")
+
+	req, err := NewBackendRequestForTest(context.Background(), cfg, AnthropicMessagesRequest{
+		Model: "gpt-5.4",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{
+				map[string]any{"type": "thinking", "thinking": defaultThinkingText, "signature": carrier},
+			}},
+			{Role: "user", Content: "continue"},
+		},
+	}, http.Header{"anthropic-beta": []string{"client-tools-2025-01-01"}})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+	if payload.Model != "gpt-5.4" {
+		t.Fatalf("compaction-carrier request should stay on main model, got %q", payload.Model)
+	}
+}
+
+func TestBuildBackendRequestPrimesProfilesBeforeUsingConfiguredWarmupModel(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			writeJSONWithStatus(w, http.StatusOK, map[string]any{
+				"object": "list",
+				"data": []map[string]any{
+					normalizeModelDescriptor(map[string]any{
+						"id":                  "gpt-5.4",
+						"supported_endpoints": []string{"/v1/responses"},
+						"capabilities":        map[string]any{"supports": map[string]any{"streaming": true}},
+					}),
+					normalizeModelDescriptor(map[string]any{
+						"id":                  "gpt-5.4-mini",
+						"supported_endpoints": []string{"/v1/chat/completions"},
+						"capabilities":        map[string]any{"supports": map[string]any{"streaming": true}},
+					}),
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL:            backend.URL,
+		BackendPath:               "/v1/responses",
+		BackendAPIKey:             "test-key",
+		BackendWarmupModel:        "gpt-5.4-mini",
+		EnableModelCapabilityInit: true,
+	})
+
+	req, err := proxy.buildBackendRequest(context.Background(), AnthropicMessagesRequest{
+		Model:    "gpt-5.4",
+		Messages: []AnthropicMessage{{Role: "user", Content: "hello"}},
+	}, http.Header{"anthropic-beta": []string{"client-tools-2025-01-01"}})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+	if payload.Model != "gpt-5.4" {
+		t.Fatalf("warmup request should fall back to main model when configured warmup profile is incompatible, got %q", payload.Model)
+	}
+}
+
 func TestClassifyCapabilityFailureRecognizesProviderStyleVariants(t *testing.T) {
 	proxy := New(Config{})
 	cases := []struct {
@@ -5861,6 +6350,13 @@ func TestClassifyCapabilityFailureRecognizesProviderStyleVariants(t *testing.T) 
 			status:  http.StatusUnprocessableEntity,
 			body:    `{"error":{"message":"Unrecognized input item type: compaction","type":"invalid_request_error","param":"input[0].type"}}`,
 			payload: OpenAIResponsesRequest{Input: []OpenAIInputItem{{Type: "compaction", ID: "cmp_123", Summary: []OpenAIReasoningPart{{Type: "summary_text", Text: "summary"}}, EncryptedContent: "opaque"}}},
+			want:    "compaction_input",
+		},
+		{
+			name:    "compaction input invalid enum with indexed param",
+			status:  http.StatusBadRequest,
+			body:    `{"error":{"message":"Invalid value for input[0].type: expected one of message, reasoning","type":"invalid_request_error","param":"input[0].type"}}`,
+			payload: OpenAIResponsesRequest{Input: []OpenAIInputItem{{Type: "compaction", ID: "cmp_123", EncryptedContent: "opaque"}}},
 			want:    "compaction_input",
 		},
 		{
@@ -6623,6 +7119,72 @@ func TestOptionsForRequestModelPassthroughTTLLeaseStaysRequestScoped(t *testing.
 	}
 	if _, ok := proxy.reprobeUntil[capabilityReprobeLeaseKey(reqB, "model")]; ok {
 		t.Fatalf("model B should not acquire reprobe lease from model A")
+	}
+}
+
+func TestOptionsForRequestInputItemPersistenceTTLLeaseStaysBackendScoped(t *testing.T) {
+	currentTime := time.Date(2026, 4, 17, 1, 0, 0, 0, time.UTC)
+	proxy := New(Config{
+		BackendBaseURL:       "https://example.com/codex",
+		BackendPath:          "/v1/responses",
+		BackendAPIKey:        "test-key",
+		CapabilityReprobeTTL: 30 * time.Minute,
+	})
+	proxy.now = func() time.Time { return currentTime }
+
+	scopeA := backendCapabilityScopeKey("claude-sonnet-4-5")
+	scopeB := backendCapabilityScopeKey("claude-haiku-4-5")
+	proxy.scopedCaps[scopeA] = scopedRuntimeCapabilities{InputItemPersistence: capabilityUnsupported}
+	proxy.scopedCaps[scopeB] = scopedRuntimeCapabilities{InputItemPersistence: capabilityUnsupported}
+	proxy.unsupportedUntil[capabilityCooldownKey(scopeA, "input_item_persistence")] = currentTime.Add(-1 * time.Minute)
+	proxy.unsupportedUntil[capabilityCooldownKey(scopeB, "input_item_persistence")] = currentTime.Add(-1 * time.Minute)
+
+	reqNoHistory := AnthropicMessagesRequest{
+		Model:    "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{{Role: "user", Content: "hi"}},
+	}
+	if opts := proxy.optionsForRequest(reqNoHistory, nil); opts.StripRoundTripItemIDs {
+		t.Fatalf("request without round-trip history should not strip ids: %+v", opts)
+	}
+	if _, ok := proxy.reprobeUntil[capabilityReprobeLeaseKey(scopeA, "input_item_persistence")]; ok {
+		t.Fatalf("request without round-trip history should not consume input_item_persistence reprobe lease")
+	}
+
+	carrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:               "rs_1",
+		Type:             "reasoning",
+		EncryptedContent: "opaque-reasoning",
+		Summary:          []OpenAIReasoningPart{{Type: "summary_text", Text: "brief reasoning"}},
+	})
+	reqWithHistoryA := AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{map[string]any{"type": "thinking", "thinking": "brief reasoning", "signature": carrier}}},
+			{Role: "user", Content: "continue"},
+		},
+	}
+	firstA := proxy.optionsForRequest(reqWithHistoryA, nil)
+	secondA := proxy.optionsForRequest(reqWithHistoryA, nil)
+	if firstA.StripRoundTripItemIDs {
+		t.Fatalf("first history request for scope A should reprobe before stripping ids: %+v", firstA)
+	}
+	if !secondA.StripRoundTripItemIDs {
+		t.Fatalf("second history request for scope A should honor reprobe lease and strip ids: %+v", secondA)
+	}
+
+	reqWithHistoryB := AnthropicMessagesRequest{
+		Model: "claude-haiku-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{map[string]any{"type": "thinking", "thinking": "brief reasoning", "signature": carrier}}},
+			{Role: "user", Content: "continue"},
+		},
+	}
+	firstB := proxy.optionsForRequest(reqWithHistoryB, nil)
+	if firstB.StripRoundTripItemIDs {
+		t.Fatalf("backend scope B should retain its own first reprobe attempt: %+v", firstB)
+	}
+	if _, ok := proxy.reprobeUntil[capabilityReprobeLeaseKey(scopeB, "input_item_persistence")]; !ok {
+		t.Fatalf("backend scope B should acquire its own reprobe lease")
 	}
 }
 

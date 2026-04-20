@@ -267,3 +267,99 @@ func TestAggregateBackendStreamReturnsBackendErrors(t *testing.T) {
 		t.Fatalf("aggregateBackendStream error = %v, want backend message", err)
 	}
 }
+
+func TestConvertToolResultInputItemPreservesStructuredProjectionAndStatus(t *testing.T) {
+	t.Parallel()
+
+	item := convertToolResultInputItem(AnthropicContentBlock{
+		ToolUseID: "toolu_1",
+		IsError:   true,
+		Content: []any{
+			map[string]any{"type": "text", "text": "stdout"},
+			map[string]any{"type": "json", "json": map[string]any{"ok": true}},
+		},
+	}, backendRequestOptions{PreserveStructuredOutput: true})
+
+	if item.Type != "function_call_output" || item.CallID != "toolu_1" {
+		t.Fatalf("tool_result item mapping incorrect: %#v", item)
+	}
+	if item.Status != "incomplete" {
+		t.Fatalf("tool_result status = %q, want incomplete", item.Status)
+	}
+	content, ok := item.Output.([]OpenAIContentItem)
+	if !ok {
+		t.Fatalf("tool_result output type = %T, want []OpenAIContentItem", item.Output)
+	}
+	want := []OpenAIContentItem{
+		{Type: "input_text", Text: "stdout"},
+		{Type: "input_text", Text: `{"ok":true}`},
+	}
+	if !reflect.DeepEqual(content, want) {
+		t.Fatalf("tool_result output = %#v, want %#v", content, want)
+	}
+}
+
+func TestConvertReasoningOrCompactionInputItemUsesUnifiedCarrierBoundary(t *testing.T) {
+	t.Parallel()
+
+	reasoningCarrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:               "rs_1",
+		Type:             "reasoning",
+		EncryptedContent: "opaque-reasoning",
+		Summary:          []OpenAIReasoningPart{{Type: "summary_text", Text: "summary"}},
+	})
+	compactionCarrier := encodeCompactionCarrier("cmp_1", "opaque-compaction")
+
+	tests := []struct {
+		name              string
+		block             AnthropicContentBlock
+		preserveReasoning bool
+		wantOK            bool
+		wantType          string
+		wantID            string
+		wantEncrypted     string
+	}{
+		{
+			name:              "preserve reasoning from thinking signature",
+			block:             AnthropicContentBlock{Type: "thinking", Signature: reasoningCarrier},
+			preserveReasoning: true,
+			wantOK:            true,
+			wantType:          "reasoning",
+			wantID:            "rs_1",
+			wantEncrypted:     "opaque-reasoning",
+		},
+		{
+			name:              "drop reasoning when reasoning preservation disabled",
+			block:             AnthropicContentBlock{Type: "redacted_thinking", Data: reasoningCarrier},
+			preserveReasoning: false,
+			wantOK:            false,
+		},
+		{
+			name:              "keep compaction even when reasoning preservation disabled",
+			block:             AnthropicContentBlock{Type: "redacted_thinking", Data: compactionCarrier},
+			preserveReasoning: false,
+			wantOK:            true,
+			wantType:          "compaction",
+			wantID:            "cmp_1",
+			wantEncrypted:     "opaque-compaction",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := convertReasoningOrCompactionInputItem(tc.block, tc.preserveReasoning)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if got.Type != tc.wantType || got.ID != tc.wantID || got.EncryptedContent != tc.wantEncrypted {
+				t.Fatalf("item = %#v, want type=%q id=%q encrypted=%q", got, tc.wantType, tc.wantID, tc.wantEncrypted)
+			}
+		})
+	}
+}
