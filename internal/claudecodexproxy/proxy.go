@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -87,6 +88,10 @@ type runtimeCapabilities struct {
 }
 
 type backendModelProfile struct {
+	Vendor                    string
+	Family                    string
+	EndpointFamily            string
+	HasExplicitFamily         bool
 	SupportsAdaptiveThinking  *bool
 	SupportsStreaming         *bool
 	SupportsStructuredOutput  *bool
@@ -101,6 +106,14 @@ type backendModelProfile struct {
 	SupportedEndpoints        map[string]struct{}
 }
 
+type backendCapabilityPreset struct {
+	DisableReasoningInclude  bool
+	DisablePhase             bool
+	DisablePromptCacheKey    bool
+	DisableContextManagement bool
+	DisableCompactionInput   bool
+}
+
 type scopedRuntimeCapabilities struct {
 	StructuredToolOutput capabilityState
 	BackendStreaming     capabilityState
@@ -111,6 +124,7 @@ type scopedRuntimeCapabilities struct {
 	Phase                capabilityState
 	ModelPassthrough     capabilityState
 	PromptCacheKey       capabilityState
+	InputItemPersistence capabilityState
 }
 
 type subagentMarker struct {
@@ -152,6 +166,15 @@ type continuityContext struct {
 	InteractionType  string
 	InteractionID    string
 	Subagent         *subagentMarker
+}
+
+type requestFeatures struct {
+	hasVisionInput        bool
+	hasToolResultHistory  bool
+	hasCompactionCarrier  bool
+	hasRoundTripHistory   bool
+	hasSystemInstructions bool
+	warmupCandidateText   string
 }
 
 func New(cfg Config) *Proxy {
@@ -268,12 +291,17 @@ func (p *Proxy) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inputTokens := estimateInputTokens(req.System, req.Messages, req.Tools)
+	toolOverhead := 0
+	multiplier := 1.0
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(req.Model)), "claude") {
 		if shouldAddClaudeToolOverhead(req.Tools, strings.TrimSpace(r.Header.Get("anthropic-beta"))) {
-			inputTokens += 346
+			toolOverhead = 346
+			inputTokens += toolOverhead
 		}
-		inputTokens = int(math.Round(float64(inputTokens) * p.cfg.ClaudeTokenMultiplier))
+		multiplier = p.cfg.ClaudeTokenMultiplier
+		inputTokens = int(math.Round(float64(inputTokens) * multiplier))
 	}
+	p.debugf("count_tokens fallback model=%q estimated_tokens=%d tool_overhead=%d multiplier=%.2f", req.Model, inputTokens, toolOverhead, multiplier)
 
 	writeJSON(w, http.StatusOK, AnthropicCountTokensResponse{
 		InputTokens: inputTokens,
@@ -412,17 +440,30 @@ func (p *Proxy) seedCapabilitiesFromModels(models []map[string]any) {
 }
 
 func extractBackendModelProfile(model map[string]any) backendModelProfile {
+	id := strings.TrimSpace(asString(model["id"]))
 	profile := backendModelProfile{
+		Vendor:             firstNonEmpty(strings.TrimSpace(asString(model["vendor"])), strings.TrimSpace(asString(model["owned_by"])), inferModelVendor(id)),
 		SupportedEndpoints: map[string]struct{}{},
 	}
-	if endpoints, ok := model["supported_endpoints"].([]any); ok {
+	switch endpoints := model["supported_endpoints"].(type) {
+	case []any:
 		for _, endpoint := range endpoints {
 			if value := strings.TrimSpace(asString(endpoint)); value != "" {
 				profile.SupportedEndpoints[value] = struct{}{}
 			}
 		}
+	case []string:
+		for _, endpoint := range endpoints {
+			if value := strings.TrimSpace(endpoint); value != "" {
+				profile.SupportedEndpoints[value] = struct{}{}
+			}
+		}
 	}
 	capabilities, _ := model["capabilities"].(map[string]any)
+	explicitFamily := strings.TrimSpace(asString(capabilities["family"]))
+	profile.Family = firstNonEmpty(explicitFamily, inferModelFamily(id))
+	profile.HasExplicitFamily = explicitFamily != ""
+	profile.EndpointFamily = inferEndpointFamily(profile.SupportedEndpoints)
 	supports, _ := capabilities["supports"].(map[string]any)
 	profile.SupportsAdaptiveThinking = asOptionalBool(supports["adaptive_thinking"])
 	profile.SupportsStreaming = asOptionalBool(supports["streaming"])
@@ -438,6 +479,80 @@ func extractBackendModelProfile(model map[string]any) backendModelProfile {
 		profile.MaxOutputTokens = asPositiveInt(limits["max_output_tokens"])
 	}
 	return profile
+}
+
+func inferEndpointFamily(endpoints map[string]struct{}) string {
+	if len(endpoints) == 0 {
+		return "unknown"
+	}
+	families := map[string]struct{}{}
+	for endpoint := range endpoints {
+		if family := normalizeEndpointFamily(endpoint); family != "" {
+			families[family] = struct{}{}
+		}
+	}
+	if len(families) == 0 {
+		return "unknown"
+	}
+	if len(families) > 1 {
+		return "mixed"
+	}
+	for family := range families {
+		return family
+	}
+	return "unknown"
+}
+
+func normalizeEndpointFamily(endpoint string) string {
+	switch strings.ToLower(strings.TrimSpace(endpoint)) {
+	case "/responses", "/v1/responses":
+		return "responses"
+	case "/messages", "/v1/messages":
+		return "messages"
+	case "/chat/completions", "/v1/chat/completions":
+		return "chat_completions"
+	default:
+		return ""
+	}
+}
+
+func profileCapabilityPreset(profile backendModelProfile) backendCapabilityPreset {
+	if profile.EndpointFamily != "responses" || !profile.HasExplicitFamily {
+		return backendCapabilityPreset{}
+	}
+	if strings.ToLower(strings.TrimSpace(profile.Vendor)) != "openai" {
+		return backendCapabilityPreset{}
+	}
+	return backendCapabilityPreset{
+		DisableReasoningInclude:  true,
+		DisablePhase:             true,
+		DisablePromptCacheKey:    true,
+		DisableContextManagement: true,
+		DisableCompactionInput:   true,
+	}
+}
+
+func shouldPresetDisableFeature(p *Proxy, scopeKey, feature string, state capabilityState, disabled bool) bool {
+	if !disabled || state != capabilityUnknown {
+		return false
+	}
+	if p == nil || p.cfg.CapabilityReprobeTTL <= 0 || strings.TrimSpace(scopeKey) == "" {
+		return true
+	}
+	p.capsMu.Lock()
+	defer p.capsMu.Unlock()
+	now := p.now()
+	leaseKey := capabilityReprobeLeaseKey(scopeKey, "preset:"+feature)
+	until, ok := p.reprobeUntil[leaseKey]
+	if !ok {
+		p.reprobeUntil[leaseKey] = now.Add(p.cfg.CapabilityReprobeTTL)
+		return true
+	}
+	if now.Before(until) {
+		return true
+	}
+	p.reprobeUntil[leaseKey] = now.Add(p.cfg.CapabilityReprobeTTL)
+	return false
 }
 
 func isWarmupCandidate(model string) bool {
@@ -457,9 +572,7 @@ func profileSupportsResponses(profile backendModelProfile) bool {
 	if len(profile.SupportedEndpoints) == 0 {
 		return true
 	}
-	_, okResponses := profile.SupportedEndpoints["/responses"]
-	_, okV1Responses := profile.SupportedEndpoints["/v1/responses"]
-	return okResponses || okV1Responses
+	return profile.EndpointFamily == "responses" || profile.EndpointFamily == "mixed"
 }
 
 func (p *Proxy) syntheticModelsPayload() map[string]any {
@@ -594,22 +707,27 @@ func inferReasoningEffortFromThinking(thinking AnthropicThinking) string {
 }
 
 func (p *Proxy) optionsForRequest(req AnthropicMessagesRequest, headers http.Header) backendRequestOptions {
-	if p.shouldPrimeModelProfiles(req, headers) {
+	features := scanRequestFeatures(req)
+	if p.shouldPrimeModelProfiles(req, headers, features) {
 		p.fetchBackendModels()
 	}
 	caps := p.snapshotCaps(p.cfg.AnonymousMode)
 	requestScopeKey := requestScopeKey(p.cfg, req)
 	compactType := detectCompactType(req)
-	model := p.selectBackendModel(req, headers, caps, compactType, requestScopeKey)
+	model := p.selectBackendModel(req, headers, caps, compactType, requestScopeKey, features)
 	usesRequestModelPassthrough := strings.TrimSpace(p.cfg.BackendModel) == "" && strings.TrimSpace(model) == strings.TrimSpace(req.Model)
 	if model != strings.TrimSpace(req.Model) {
 		usesRequestModelPassthrough = false
 	}
 	backendScopeKey := backendCapabilityScopeKey(model)
-	scoped := p.snapshotScopedCaps(backendScopeKey, p.cfg.AnonymousMode)
+	hasRoundTripHistoryItems := features.hasRoundTripHistory
+	scoped := p.snapshotScopedCaps(backendScopeKey, p.cfg.AnonymousMode, !hasRoundTripHistoryItems)
+	stripRoundTripItemIDs := hasRoundTripHistoryItems && scoped.InputItemPersistence == capabilityUnsupported
 	profile := backendModelProfile{}
+	preset := backendCapabilityPreset{}
 	if p.cfg.EnableModelCapabilityInit {
 		profile = caps.ModelProfiles[strings.TrimSpace(model)]
+		preset = profileCapabilityPreset(profile)
 	}
 
 	reasoning := applyReasoningProfile(p.resolveBackendReasoning(req), profile, p.cfg.EnableModelCapabilityInit)
@@ -619,8 +737,18 @@ func (p *Proxy) optionsForRequest(req AnthropicMessagesRequest, headers http.Hea
 	enableStructuredOutput := scoped.StructuredToolOutput != capabilityUnsupported
 	enableBackendStreaming := req.Stream && !p.cfg.DisableStreamingBackend && scoped.BackendStreaming != capabilityUnsupported
 	preserveCompactionInput := scoped.CompactionInput != capabilityUnsupported
-	enableContextManagement := p.cfg.EnableModelCapabilityInit && scoped.ContextManagement != capabilityUnsupported && preserveCompactionInput && requestContainsCompactionCarrier(req)
+	if shouldPresetDisableFeature(p, backendScopeKey, "compaction_input", scoped.CompactionInput, preset.DisableCompactionInput) {
+		preserveCompactionInput = false
+	}
+	enableContextManagement := p.cfg.EnableModelCapabilityInit && scoped.ContextManagement != capabilityUnsupported && preserveCompactionInput && features.hasCompactionCarrier
+	if shouldPresetDisableFeature(p, backendScopeKey, "context_management", scoped.ContextManagement, preset.DisableContextManagement) {
+		enableContextManagement = false
+	}
 	preserveReasoningItems := scoped.Reasoning != capabilityUnsupported
+	enablePromptCacheKey := !p.cfg.AnonymousMode && !p.cfg.DisablePromptCacheKey && derivedPromptCacheKey(req, headers) != "" && scoped.PromptCacheKey != capabilityUnsupported
+	if shouldPresetDisableFeature(p, backendScopeKey, "prompt_cache_key", scoped.PromptCacheKey, preset.DisablePromptCacheKey) {
+		enablePromptCacheKey = false
+	}
 	if profile.SupportsAdaptiveThinking != nil && !*profile.SupportsAdaptiveThinking {
 		enableReasoning = false
 		enableReasoningInclude = false
@@ -629,11 +757,17 @@ func (p *Proxy) optionsForRequest(req AnthropicMessagesRequest, headers http.Hea
 	if profile.SupportsPhase != nil && !*profile.SupportsPhase {
 		enablePhaseCommentary = false
 	}
+	if shouldPresetDisableFeature(p, backendScopeKey, "phase", scoped.Phase, preset.DisablePhase) {
+		enablePhaseCommentary = false
+	}
 	if profile.SupportsStructuredOutput != nil && !*profile.SupportsStructuredOutput {
 		enableStructuredOutput = false
 	}
 	if profile.SupportsStreaming != nil && !*profile.SupportsStreaming {
 		enableBackendStreaming = false
+	}
+	if shouldPresetDisableFeature(p, backendScopeKey, "reasoning_include", scoped.ReasoningInclude, preset.DisableReasoningInclude) {
+		enableReasoningInclude = false
 	}
 	enableParallelToolCalls := p.cfg.EnableModelCapabilityInit &&
 		len(req.Tools) > 0 &&
@@ -655,13 +789,14 @@ func (p *Proxy) optionsForRequest(req AnthropicMessagesRequest, headers http.Hea
 		EnableReasoning:                   enableReasoning,
 		EnableReasoningInclude:            enableReasoningInclude,
 		EnablePhaseCommentary:             enablePhaseCommentary,
-		EnablePromptCacheKey:              !p.cfg.AnonymousMode && !p.cfg.DisablePromptCacheKey && derivedPromptCacheKey(req, headers) != "" && scoped.PromptCacheKey != capabilityUnsupported,
+		EnablePromptCacheKey:              enablePromptCacheKey,
 		EnableContextManagement:           enableContextManagement,
 		PreserveCompactionInput:           preserveCompactionInput,
 		PreserveStructuredOutput:          enableStructuredOutput,
 		PreserveReasoningItems:            preserveReasoningItems,
 		EnableBackendStreaming:            enableBackendStreaming,
 		EnableParallelToolCalls:           enableParallelToolCalls,
+		StripRoundTripItemIDs:             stripRoundTripItemIDs,
 		UsesRequestModelPassthrough:       usesRequestModelPassthrough,
 	}
 }
@@ -686,8 +821,8 @@ func applyReasoningProfile(reasoning *OpenAIReasoning, profile backendModelProfi
 	return &adjusted
 }
 
-func (p *Proxy) selectBackendModel(req AnthropicMessagesRequest, headers http.Header, caps runtimeCapabilities, compactType int, requestScopeKey string) string {
-	if warmupModel := p.resolveWarmupModel(req, headers, caps, compactType); warmupModel != "" {
+func (p *Proxy) selectBackendModel(req AnthropicMessagesRequest, headers http.Header, caps runtimeCapabilities, compactType int, requestScopeKey string, features requestFeatures) string {
+	if warmupModel := p.resolveWarmupModel(req, headers, caps, compactType, features); warmupModel != "" {
 		return warmupModel
 	}
 	model := strings.TrimSpace(p.cfg.EffectiveBackendModel(req.Model))
@@ -741,8 +876,8 @@ func (p *Proxy) snapshotModelPassthroughState(scopeKey string) capabilityState {
 	return capabilityUnknown
 }
 
-func (p *Proxy) resolveWarmupModel(req AnthropicMessagesRequest, headers http.Header, caps runtimeCapabilities, compactType int) string {
-	if !isWarmupRequest(req, headers, compactType) {
+func (p *Proxy) resolveWarmupModel(req AnthropicMessagesRequest, headers http.Header, caps runtimeCapabilities, compactType int, features requestFeatures) string {
+	if !isWarmupRequest(req, headers, compactType, features) {
 		return ""
 	}
 	if strings.TrimSpace(p.cfg.BackendModel) != "" {
@@ -769,7 +904,7 @@ func (p *Proxy) resolveWarmupModel(req AnthropicMessagesRequest, headers http.He
 	return warmupModel
 }
 
-func isWarmupRequest(req AnthropicMessagesRequest, headers http.Header, compactType int) bool {
+func isWarmupRequest(req AnthropicMessagesRequest, headers http.Header, compactType int, features requestFeatures) bool {
 	if compactType != compactNone {
 		return false
 	}
@@ -779,13 +914,16 @@ func isWarmupRequest(req AnthropicMessagesRequest, headers http.Header, compactT
 	if len(req.Tools) > 0 || req.ToolChoice != nil {
 		return false
 	}
-	if requestHasVisionInput(req) || requestHasToolResultHistory(req) {
+	if len(req.Messages) != 1 {
 		return false
 	}
-	return len(req.Messages) > 0
+	if features.hasSystemInstructions || features.hasVisionInput || features.hasToolResultHistory || features.hasCompactionCarrier {
+		return false
+	}
+	return features.warmupCandidateText != ""
 }
 
-func (p *Proxy) shouldPrimeModelProfiles(req AnthropicMessagesRequest, headers http.Header) bool {
+func (p *Proxy) shouldPrimeModelProfiles(req AnthropicMessagesRequest, headers http.Header, features requestFeatures) bool {
 	if !p.cfg.EnableModelCapabilityInit {
 		return false
 	}
@@ -793,10 +931,13 @@ func (p *Proxy) shouldPrimeModelProfiles(req AnthropicMessagesRequest, headers h
 	if caps.ModelsFetched {
 		return false
 	}
-	if strings.TrimSpace(p.cfg.BackendWarmupModel) != "" && isWarmupRequest(req, headers, detectCompactType(req)) {
-		return false
-	}
-	return req.Stream || len(req.Tools) > 0 || p.resolveBackendReasoning(req) != nil || isWarmupRequest(req, headers, detectCompactType(req))
+	compactType := detectCompactType(req)
+	return req.Stream ||
+		len(req.Tools) > 0 ||
+		p.resolveBackendReasoning(req) != nil ||
+		isWarmupRequest(req, headers, compactType, features) ||
+		compactType != compactNone ||
+		features.hasCompactionCarrier
 }
 
 func modelProfileSupportsRequest(profile backendModelProfile, req AnthropicMessagesRequest) bool {
@@ -900,7 +1041,14 @@ func dropCompactionInputItems(items []OpenAIInputItem) []OpenAIInputItem {
 	return filtered
 }
 
-func requestHasVisionInput(req AnthropicMessagesRequest) bool {
+func scanRequestFeatures(req AnthropicMessagesRequest) requestFeatures {
+	features := requestFeatures{}
+	if systemBlocks, err := normalizeSystemBlocks(req.System); err == nil {
+		features.hasSystemInstructions = strings.TrimSpace(systemBlocksToInstructions(systemBlocks)) != ""
+	}
+	if len(req.Messages) == 1 {
+		features.warmupCandidateText = warmupCandidateText(req.Messages[0])
+	}
 	for _, message := range req.Messages {
 		blocks, err := normalizeContentBlocks(message.Content)
 		if err != nil {
@@ -909,52 +1057,43 @@ func requestHasVisionInput(req AnthropicMessagesRequest) bool {
 		for _, block := range blocks {
 			switch block.Type {
 			case "image", "document", "file":
-				return true
+				features.hasVisionInput = true
 			case "tool_result":
+				features.hasToolResultHistory = true
 				if toolResultContainsMedia(block.Content) {
-					return true
+					features.hasVisionInput = true
 				}
+			}
+			carrier := anthropicThinkingCarrier(block)
+			if carrier == "" {
+				continue
+			}
+			if _, ok := decodeCompactionCarrier(carrier); ok {
+				features.hasCompactionCarrier = true
+				features.hasRoundTripHistory = true
+			}
+			if _, ok := decodeReasoningCarrier(carrier); ok {
+				features.hasRoundTripHistory = true
 			}
 		}
 	}
-	return false
+	return features
+}
+
+func requestHasVisionInput(req AnthropicMessagesRequest) bool {
+	return scanRequestFeatures(req).hasVisionInput
 }
 
 func requestHasToolResultHistory(req AnthropicMessagesRequest) bool {
-	for _, message := range req.Messages {
-		blocks, err := normalizeContentBlocks(message.Content)
-		if err != nil {
-			continue
-		}
-		for _, block := range blocks {
-			if block.Type == "tool_result" {
-				return true
-			}
-		}
-	}
-	return false
+	return scanRequestFeatures(req).hasToolResultHistory
 }
 
 func requestContainsCompactionCarrier(req AnthropicMessagesRequest) bool {
-	for _, message := range req.Messages {
-		blocks, err := normalizeContentBlocks(message.Content)
-		if err != nil {
-			continue
-		}
-		for _, block := range blocks {
-			switch block.Type {
-			case "thinking":
-				if _, ok := decodeCompactionCarrier(block.Signature); ok {
-					return true
-				}
-			case "redacted_thinking":
-				if _, ok := decodeCompactionCarrier(block.Data); ok {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return scanRequestFeatures(req).hasCompactionCarrier
+}
+
+func requestHasRoundTripHistoryItems(req AnthropicMessagesRequest) bool {
+	return scanRequestFeatures(req).hasRoundTripHistory
 }
 
 func anthropicReqMaxOutputTokens(req AnthropicMessagesRequest, profile backendModelProfile, enableModelCapabilityInit bool) int {
@@ -1075,7 +1214,9 @@ func (p *Proxy) effectiveCapabilityStateLocked(scopeKey, feature string, state c
 	if p.cfg.RequestTimeout > 0 && p.cfg.RequestTimeout < leaseTTL {
 		leaseTTL = p.cfg.RequestTimeout
 	}
-	p.reprobeUntil[leaseKey] = p.now().Add(leaseTTL)
+	leaseUntil := p.now().Add(leaseTTL)
+	p.reprobeUntil[leaseKey] = leaseUntil
+	p.debugf("capability feature=%s scope=%q cooldown expired; reprobe lease until=%s", feature, scopeKey, leaseUntil.Format(time.RFC3339))
 	return capabilityUnknown
 }
 
@@ -1083,15 +1224,24 @@ func (p *Proxy) setCapabilityCooldownLocked(scopeKey, feature string) {
 	if p.cfg.CapabilityReprobeTTL <= 0 {
 		return
 	}
-	p.unsupportedUntil[capabilityCooldownKey(scopeKey, feature)] = p.now().Add(p.cfg.CapabilityReprobeTTL)
+	until := p.now().Add(p.cfg.CapabilityReprobeTTL)
+	p.unsupportedUntil[capabilityCooldownKey(scopeKey, feature)] = until
+	p.debugf("capability feature=%s scope=%q marked unsupported until=%s", feature, scopeKey, until.Format(time.RFC3339))
 }
 
 func (p *Proxy) clearCapabilityCooldownLocked(scopeKey, feature string) {
-	delete(p.unsupportedUntil, capabilityCooldownKey(scopeKey, feature))
-	delete(p.reprobeUntil, capabilityReprobeLeaseKey(scopeKey, feature))
+	cooldownKey := capabilityCooldownKey(scopeKey, feature)
+	leaseKey := capabilityReprobeLeaseKey(scopeKey, feature)
+	_, hadCooldown := p.unsupportedUntil[cooldownKey]
+	_, hadLease := p.reprobeUntil[leaseKey]
+	delete(p.unsupportedUntil, cooldownKey)
+	delete(p.reprobeUntil, leaseKey)
+	if hadCooldown || hadLease {
+		p.debugf("capability feature=%s scope=%q restored", feature, scopeKey)
+	}
 }
 
-func (p *Proxy) snapshotScopedCaps(scopeKey string, skipPromptCacheKeyReprobe bool) scopedRuntimeCapabilities {
+func (p *Proxy) snapshotScopedCaps(scopeKey string, skipPromptCacheKeyReprobe, skipInputItemPersistenceReprobe bool) scopedRuntimeCapabilities {
 	if strings.TrimSpace(scopeKey) == "" {
 		return scopedRuntimeCapabilities{}
 	}
@@ -1109,6 +1259,9 @@ func (p *Proxy) snapshotScopedCaps(scopeKey string, skipPromptCacheKeyReprobe bo
 	if !skipPromptCacheKeyReprobe {
 		scoped.PromptCacheKey = p.effectiveCapabilityStateLocked(scopeKey, "prompt_cache_key", scoped.PromptCacheKey)
 	}
+	if !skipInputItemPersistenceReprobe {
+		scoped.InputItemPersistence = p.effectiveCapabilityStateLocked(scopeKey, "input_item_persistence", scoped.InputItemPersistence)
+	}
 	return scoped
 }
 
@@ -1119,7 +1272,7 @@ func (p *Proxy) setCapabilityUnsupported(feature string, opts backendRequestOpti
 	case "metadata":
 		p.caps.Metadata = capabilityUnsupported
 		p.setCapabilityCooldownLocked("global", "metadata")
-	case "structured_output", "stream", "reasoning", "reasoning_include", "phase", "prompt_cache_key", "context_management", "compaction_input":
+	case "structured_output", "stream", "reasoning", "reasoning_include", "phase", "prompt_cache_key", "context_management", "compaction_input", "input_item_persistence":
 		if strings.TrimSpace(opts.BackendCapabilityScopeKey) == "" {
 			return
 		}
@@ -1141,6 +1294,8 @@ func (p *Proxy) setCapabilityUnsupported(feature string, opts backendRequestOpti
 			scoped.ContextManagement = capabilityUnsupported
 		case "compaction_input":
 			scoped.CompactionInput = capabilityUnsupported
+		case "input_item_persistence":
+			scoped.InputItemPersistence = capabilityUnsupported
 		}
 		p.scopedCaps[opts.BackendCapabilityScopeKey] = scoped
 		p.setCapabilityCooldownLocked(opts.BackendCapabilityScopeKey, feature)
@@ -1195,6 +1350,10 @@ func (p *Proxy) learnCapabilitiesFromRequest(opts backendRequestOptions, payload
 		if requestUsesCompactionInput(payload) {
 			scoped.CompactionInput = capabilitySupported
 			p.clearCapabilityCooldownLocked(opts.BackendCapabilityScopeKey, "compaction_input")
+		}
+		if requestUsesRoundTripHistoryItems(payload) {
+			scoped.InputItemPersistence = capabilitySupported
+			p.clearCapabilityCooldownLocked(opts.BackendCapabilityScopeKey, "input_item_persistence")
 		}
 		p.scopedCaps[opts.BackendCapabilityScopeKey] = scoped
 	}
@@ -1472,7 +1631,10 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 		p.debugf("adaptive retry disabling feature=%s status=%d body=%s", feature, resp.StatusCode, sanitizeLogValue(string(body)))
 		tried[feature] = true
 		if feature == "input_item_persistence" {
-			opts.StripRoundTripItemIDs = true
+			p.setCapabilityUnsupported(feature, opts)
+			nextOpts := p.optionsForRequest(anthropicReq, headers)
+			nextOpts.StripRoundTripItemIDs = true
+			opts = nextOpts
 			continue
 		}
 		if feature == "model" && strings.TrimSpace(p.cfg.BackendModel) == "" {
@@ -1509,7 +1671,7 @@ func (p *Proxy) classifyCapabilityFailure(status int, body []byte, opts backendR
 		return "prompt_cache_key"
 	case len(payload.ContextManagement) > 0 && matchesParameterFailure(msg, "context_management", hint.Param):
 		return "context_management"
-	case requestUsesCompactionInput(payload) && matchesCompactionInputFailure(msg):
+	case requestUsesCompactionInput(payload) && matchesCompactionInputFailure(msg, hint.Param, payload):
 		return "compaction_input"
 	case requestUsesRoundTripHistoryItems(payload) && matchesInputItemPersistenceFailure(msg):
 		return "input_item_persistence"
@@ -1868,15 +2030,48 @@ func matchesParameterFailure(msg, param, observedParam string) bool {
 	return false
 }
 
-func matchesCompactionInputFailure(msg string) bool {
-	return strings.Contains(msg, "compaction") &&
-		(strings.Contains(msg, "unsupported") || strings.Contains(msg, "invalid") || strings.Contains(msg, "unknown") || strings.Contains(msg, "unrecognized")) &&
-		(strings.Contains(msg, "input") || strings.Contains(msg, "item") || strings.Contains(msg, "type"))
+func matchesCompactionInputFailure(msg, observedParam string, payload OpenAIResponsesRequest) bool {
+	messageHintsTypeFailure := strings.Contains(msg, "unsupported") ||
+		strings.Contains(msg, "invalid") ||
+		strings.Contains(msg, "unknown") ||
+		strings.Contains(msg, "unrecognized")
+	if strings.Contains(msg, "compaction") && messageHintsTypeFailure &&
+		(strings.Contains(msg, "input") || strings.Contains(msg, "item") || strings.Contains(msg, "type")) {
+		return true
+	}
+	if !observedParamTargetsCompactionInput(payload, observedParam) {
+		return false
+	}
+	return messageHintsTypeFailure ||
+		strings.Contains(msg, "expected") ||
+		strings.Contains(msg, "allowed") ||
+		strings.Contains(msg, "valid") ||
+		strings.Contains(msg, "enum") ||
+		strings.Contains(msg, "one of")
+}
+
+func observedParamTargetsCompactionInput(payload OpenAIResponsesRequest, observedParam string) bool {
+	observedParam = strings.ToLower(strings.TrimSpace(observedParam))
+	if observedParam == "" {
+		return false
+	}
+	matches := regexp.MustCompile(`^input\[(\d+)\](?:\.type)?$`).FindStringSubmatch(observedParam)
+	if len(matches) != 2 {
+		return false
+	}
+	idx, err := strconv.Atoi(matches[1])
+	if err != nil || idx < 0 || idx >= len(payload.Input) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(payload.Input[idx].Type), "compaction")
 }
 
 func matchesInputItemPersistenceFailure(msg string) bool {
 	return strings.Contains(msg, "items are not persisted when `store` is set to false") ||
-		(strings.Contains(msg, "item with id") && strings.Contains(msg, "not found") && strings.Contains(msg, "input"))
+		(strings.Contains(msg, "item with id") && strings.Contains(msg, "not found") && strings.Contains(msg, "input")) ||
+		(strings.Contains(msg, "not persisted") && strings.Contains(msg, "store") && strings.Contains(msg, "item")) ||
+		(strings.Contains(msg, "remove this item from your input") && strings.Contains(msg, "store")) ||
+		(strings.Contains(msg, "stateless") && strings.Contains(msg, "item") && strings.Contains(msg, "id"))
 }
 
 func matchesModelFailure(msg, observedParam, observedCode string) bool {
@@ -2147,7 +2342,7 @@ func detectCompactType(req AnthropicMessagesRequest) int {
 		return compactNone
 	}
 	for _, block := range systemBlocks {
-		if strings.HasPrefix(block.Text, compactSystemPromptStart) {
+		if strings.HasPrefix(strings.TrimSpace(block.Text), compactSystemPromptStart) {
 			return compactRequest
 		}
 	}
@@ -2214,6 +2409,33 @@ func compactCandidateText(message AnthropicMessage) string {
 			if strings.TrimSpace(text) != "" {
 				texts = append(texts, text)
 			}
+		}
+		return strings.Join(texts, "\n\n")
+	}
+}
+
+func warmupCandidateText(message AnthropicMessage) string {
+	if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+		return ""
+	}
+	switch typed := message.Content.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		blocks, err := normalizeContentBlocks(typed)
+		if err != nil || len(blocks) == 0 {
+			return ""
+		}
+		texts := make([]string, 0, len(blocks))
+		for _, block := range blocks {
+			if block.Type != "text" {
+				return ""
+			}
+			text := strings.TrimSpace(stripSubagentMarkerFromText(block.Text))
+			if text == "" || strings.Contains(text, "<system-reminder>") {
+				return ""
+			}
+			texts = append(texts, text)
 		}
 		return strings.Join(texts, "\n\n")
 	}
@@ -2575,56 +2797,13 @@ func convertMessageBlocks(role string, blocks []AnthropicContentBlock, opts back
 				return nil, err
 			}
 			pending = append(pending, item)
-		case "tool_use":
+		case "tool_use", "tool_result", "thinking", "redacted_thinking":
 			flushPending()
-			arguments := strings.TrimSpace(string(block.Input))
-			if arguments == "" {
-				arguments = "{}"
+			converted, err := convertSemanticAnthropicBlock(block, opts)
+			if err != nil {
+				return nil, err
 			}
-			callID := block.ID
-			if callID == "" {
-				callID = "call_missing_id"
-			}
-			items = append(items, OpenAIInputItem{
-				Type:      "function_call",
-				Name:      block.Name,
-				CallID:    callID,
-				Arguments: arguments,
-			})
-		case "tool_result":
-			flushPending()
-			status := "completed"
-			if block.IsError {
-				status = "incomplete"
-			}
-			items = append(items, OpenAIInputItem{
-				Type:   "function_call_output",
-				CallID: block.ToolUseID,
-				Output: convertToolResultOutput(block.Content, opts.PreserveStructuredOutput),
-				Status: status,
-			})
-		case "thinking":
-			flushPending()
-			if compactionItem, ok := decodeCompactionCarrier(block.Signature); ok {
-				items = append(items, compactionItem)
-				continue
-			}
-			if opts.PreserveReasoningItems {
-				if reasoningItem, ok := convertThinkingBlock(block); ok {
-					items = append(items, reasoningItem)
-				}
-			}
-		case "redacted_thinking":
-			flushPending()
-			if compactionItem, ok := decodeCompactionCarrier(block.Data); ok {
-				items = append(items, compactionItem)
-				continue
-			}
-			if opts.PreserveReasoningItems {
-				if reasoningItem, ok := convertRedactedThinkingBlock(block); ok {
-					items = append(items, reasoningItem)
-				}
-			}
+			items = append(items, converted...)
 		default:
 			return nil, fmt.Errorf("unsupported anthropic block type %q", block.Type)
 		}
@@ -2632,6 +2811,80 @@ func convertMessageBlocks(role string, blocks []AnthropicContentBlock, opts back
 
 	flushPending()
 	return items, nil
+}
+
+func convertSemanticAnthropicBlock(block AnthropicContentBlock, opts backendRequestOptions) ([]OpenAIInputItem, error) {
+	switch block.Type {
+	case "tool_use":
+		return []OpenAIInputItem{convertToolUseInputItem(block)}, nil
+	case "tool_result":
+		return []OpenAIInputItem{convertToolResultInputItem(block, opts)}, nil
+	case "thinking", "redacted_thinking":
+		if item, ok := convertReasoningOrCompactionInputItem(block, opts.PreserveReasoningItems); ok {
+			return []OpenAIInputItem{item}, nil
+		}
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported semantic anthropic block type %q", block.Type)
+	}
+}
+
+func convertToolUseInputItem(block AnthropicContentBlock) OpenAIInputItem {
+	arguments := strings.TrimSpace(string(block.Input))
+	if arguments == "" {
+		arguments = "{}"
+	}
+	callID := block.ID
+	if callID == "" {
+		callID = "call_missing_id"
+	}
+	return OpenAIInputItem{
+		Type:      "function_call",
+		Name:      block.Name,
+		CallID:    callID,
+		Arguments: arguments,
+	}
+}
+
+func convertToolResultInputItem(block AnthropicContentBlock, opts backendRequestOptions) OpenAIInputItem {
+	return OpenAIInputItem{
+		Type:   "function_call_output",
+		CallID: block.ToolUseID,
+		Output: convertToolResultOutput(block.Content, opts.PreserveStructuredOutput),
+		Status: toolResultStatus(block),
+	}
+}
+
+func toolResultStatus(block AnthropicContentBlock) string {
+	if block.IsError {
+		return "incomplete"
+	}
+	return "completed"
+}
+
+func convertReasoningOrCompactionInputItem(block AnthropicContentBlock, preserveReasoning bool) (OpenAIInputItem, bool) {
+	carrier := anthropicThinkingCarrier(block)
+	if carrier == "" {
+		return OpenAIInputItem{}, false
+	}
+	if item, ok := decodeCompactionCarrier(carrier); ok {
+		return item, true
+	}
+	if !preserveReasoning {
+		return OpenAIInputItem{}, false
+	}
+	return decodeReasoningCarrier(carrier)
+}
+
+func anthropicThinkingCarrier(block AnthropicContentBlock) string {
+	switch block.Type {
+	case "thinking":
+		return strings.TrimSpace(block.Signature)
+	case "redacted_thinking":
+		return strings.TrimSpace(block.Data)
+	default:
+		return ""
+	}
 }
 
 func convertImageBlock(block AnthropicContentBlock) (OpenAIContentItem, error) {
@@ -2745,26 +2998,6 @@ func defaultDocumentFilename(mediaType string) string {
 	default:
 		return "document"
 	}
-}
-
-func convertThinkingBlock(block AnthropicContentBlock) (OpenAIInputItem, bool) {
-	if item, ok := decodeCompactionCarrier(block.Signature); ok {
-		return item, true
-	}
-	if item, ok := decodeReasoningCarrier(block.Signature); ok {
-		return item, true
-	}
-	return OpenAIInputItem{}, false
-}
-
-func convertRedactedThinkingBlock(block AnthropicContentBlock) (OpenAIInputItem, bool) {
-	if item, ok := decodeCompactionCarrier(block.Data); ok {
-		return item, true
-	}
-	if item, ok := decodeReasoningCarrier(block.Data); ok {
-		return item, true
-	}
-	return OpenAIInputItem{}, false
 }
 
 func encodeCompactionCarrier(id, encryptedContent string) string {
@@ -2953,32 +3186,62 @@ func flattenToolResult(raw any) string {
 	}
 }
 
-func convertToolResultOutput(raw any, allowStructured bool) any {
-	if !allowStructured {
-		return flattenToolResult(raw)
+type toolResultOutputProjection struct {
+	raw                 any
+	rawBlockList        bool
+	blocks              []AnthropicContentBlock
+	preservedStructured any
+}
+
+func newToolResultOutputProjection(raw any) toolResultOutputProjection {
+	projection := toolResultOutputProjection{
+		raw:          raw,
+		rawBlockList: isRawToolResultBlockList(raw),
 	}
 	if preserved, ok := preserveUnsupportedStructuredToolResult(raw); ok {
-		return preserved
+		projection.preservedStructured = preserved
 	}
-	if !isRawToolResultBlockList(raw) {
-		if text, ok := extractStructuredToolResultText(raw); ok {
-			return text
-		}
-	}
-
 	blocks, err := normalizeContentBlocks(raw)
-	if err != nil || len(blocks) == 0 {
-		return flattenToolResult(raw)
+	if err == nil && len(blocks) > 0 {
+		projection.blocks = blocks
 	}
-	if hasTextOnlyToolResultBlocks(blocks) || hasSummaryOnlyToolResultBlock(blocks) {
-		return flattenToolResult(blocks)
+	return projection
+}
+
+func (p toolResultOutputProjection) flatten() string {
+	if len(p.blocks) > 0 {
+		return flattenToolResult(p.blocks)
 	}
-	if hasUnsupportedStructuredToolResultBlock(blocks) {
-		return preserveToolResultContentAsJSON(blocks)
+	return flattenToolResult(p.raw)
+}
+
+func (p toolResultOutputProjection) extractStructuredText() (string, bool) {
+	if p.rawBlockList {
+		return "", false
+	}
+	return extractStructuredToolResultText(p.raw)
+}
+
+func (p toolResultOutputProjection) shouldPreferText() bool {
+	if len(p.blocks) == 0 {
+		return true
+	}
+	return hasTextOnlyToolResultBlocks(p.blocks) || hasSummaryOnlyToolResultBlock(p.blocks)
+}
+
+func (p toolResultOutputProjection) structured() any {
+	if p.preservedStructured != nil {
+		return p.preservedStructured
+	}
+	if len(p.blocks) == 0 {
+		return nil
+	}
+	if hasUnsupportedStructuredToolResultBlock(p.blocks) {
+		return preserveToolResultContentAsJSON(p.blocks)
 	}
 
-	content := make([]OpenAIContentItem, 0, len(blocks))
-	for _, block := range blocks {
+	content := make([]OpenAIContentItem, 0, len(p.blocks))
+	for _, block := range p.blocks {
 		switch block.Type {
 		case "", "text":
 			if strings.TrimSpace(block.Text) != "" {
@@ -3011,11 +3274,27 @@ func convertToolResultOutput(raw any, allowStructured bool) any {
 			}
 		}
 	}
-
 	if len(content) == 0 {
-		return flattenToolResult(raw)
+		return nil
 	}
 	return content
+}
+
+func convertToolResultOutput(raw any, allowStructured bool) any {
+	projection := newToolResultOutputProjection(raw)
+	if !allowStructured {
+		return projection.flatten()
+	}
+	if text, ok := projection.extractStructuredText(); ok {
+		return text
+	}
+	if projection.shouldPreferText() {
+		return projection.flatten()
+	}
+	if structured := projection.structured(); structured != nil {
+		return structured
+	}
+	return projection.flatten()
 }
 
 func isRawToolResultBlockList(raw any) bool {
@@ -3755,6 +4034,7 @@ type sseTranslator struct {
 	textBlocks        map[string]int
 	closedTextBlocks  map[string]bool
 	textBlockHasDelta map[string]bool
+	textBlockBuffers  map[string]*strings.Builder
 	toolBlocks        map[string]int
 	closedToolBlocks  map[string]bool
 	toolArguments     map[string]string
@@ -3763,7 +4043,7 @@ type sseTranslator struct {
 	toolArgumentBytes map[string]int
 	reasoningBlocks   map[string]int
 	closedReasoning   map[string]bool
-	reasoningText     map[string]string
+	reasoningBuffers  map[string]*strings.Builder
 	toolNames         map[string]string
 }
 
@@ -3777,6 +4057,7 @@ func newSSETranslator(w io.Writer, flusher http.Flusher, advertisedModel, messag
 		textBlocks:        map[string]int{},
 		closedTextBlocks:  map[string]bool{},
 		textBlockHasDelta: map[string]bool{},
+		textBlockBuffers:  map[string]*strings.Builder{},
 		toolBlocks:        map[string]int{},
 		closedToolBlocks:  map[string]bool{},
 		toolArguments:     map[string]string{},
@@ -3785,7 +4066,7 @@ func newSSETranslator(w io.Writer, flusher http.Flusher, advertisedModel, messag
 		toolArgumentBytes: map[string]int{},
 		reasoningBlocks:   map[string]int{},
 		closedReasoning:   map[string]bool{},
-		reasoningText:     map[string]string{},
+		reasoningBuffers:  map[string]*strings.Builder{},
 		toolNames:         map[string]string{},
 	}
 }
@@ -3847,56 +4128,38 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 
 	switch event.Type {
 	case "response.content_part.added":
-		if event.Part != nil && event.Part.Type == "output_text" {
-			blockKey := textBlockKey(event.ItemID, event.ContentIndex)
-			index := t.startTextBlock(blockKey)
-			if strings.TrimSpace(event.Part.Text) != "" && !t.textBlockHasDelta[blockKey] {
-				t.writeEvent("content_block_delta", map[string]any{
-					"type":  "content_block_delta",
-					"index": index,
-					"delta": map[string]any{
-						"type": "text_delta",
-						"text": event.Part.Text,
-					},
-				})
-				t.textBlockHasDelta[blockKey] = true
+		if event.Part != nil {
+			switch event.Part.Type {
+			case "output_text":
+				blockKey := textBlockKey(event.ItemID, event.ContentIndex)
+				t.emitTextSnapshot(blockKey, event.Part.Text)
+			case "reasoning_text", "summary_text":
+				t.emitReasoningSnapshot(event.ItemID, event.Part.Text)
 			}
 		}
 	case "response.output_text.delta":
 		blockKey := textBlockKey(event.ItemID, event.ContentIndex)
-		index := t.startTextBlock(blockKey)
-		t.writeEvent("content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": index,
-			"delta": map[string]any{
-				"type": "text_delta",
-				"text": event.Delta,
-			},
-		})
-		t.textBlockHasDelta[blockKey] = true
+		t.appendTextDelta(blockKey, event.Delta)
 	case "response.output_text.done", "response.content_part.done":
+		if event.Part != nil {
+			switch event.Part.Type {
+			case "reasoning_text", "summary_text":
+				t.emitReasoningSnapshot(event.ItemID, fallback(event.Text, event.Part.Text))
+				break
+			}
+		}
+		if event.Part != nil && (event.Part.Type == "reasoning_text" || event.Part.Type == "summary_text") {
+			break
+		}
 		blockKey := textBlockKey(event.ItemID, event.ContentIndex)
 		text := event.Text
 		if event.Part != nil && strings.TrimSpace(text) == "" {
 			text = event.Part.Text
 		}
-		index, ok := t.textBlocks[blockKey]
-		if !ok && strings.TrimSpace(text) != "" {
-			index = t.startTextBlock(blockKey)
-			ok = true
+		if strings.TrimSpace(text) != "" {
+			t.emitTextSnapshot(blockKey, text)
 		}
-		if ok && !t.closedTextBlocks[blockKey] {
-			if strings.TrimSpace(text) != "" && !t.textBlockHasDelta[blockKey] {
-				t.writeEvent("content_block_delta", map[string]any{
-					"type":  "content_block_delta",
-					"index": index,
-					"delta": map[string]any{
-						"type": "text_delta",
-						"text": text,
-					},
-				})
-				t.textBlockHasDelta[blockKey] = true
-			}
+		if index, ok := t.textBlocks[blockKey]; ok && !t.closedTextBlocks[blockKey] {
 			t.writeEvent("content_block_stop", map[string]any{
 				"type":  "content_block_stop",
 				"index": index,
@@ -3909,6 +4172,12 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 			case "function_call":
 				t.toolNames[event.Item.ID] = event.Item.Name
 				t.debugfTool("stream tool started item_id=%q call_id=%q name=%q", event.Item.ID, fallback(event.Item.CallID, event.Item.ID), event.Item.Name)
+				if t.closedToolBlocks[event.Item.ID] {
+					if err := t.acceptLateClosedToolArguments(event.Item.ID, event.Item.Arguments, "response.output_item.added"); err != nil {
+						return err
+					}
+					break
+				}
 				index := t.startToolBlock(event.Item.ID, fallback(event.Item.CallID, event.Item.ID), event.Item.Name)
 				if strings.TrimSpace(event.Item.Arguments) != "" {
 					if err := t.validateToolArgumentsPayload(event.Item.ID, event.Item.Arguments); err != nil {
@@ -3925,17 +4194,13 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 					})
 				}
 			case "reasoning":
-				if text := joinReasoningText(eventItemToOutput(*event.Item)); text != "" {
-					index := t.startThinkingBlock(event.Item.ID)
-					t.writeEvent("content_block_delta", map[string]any{
-						"type":  "content_block_delta",
-						"index": index,
-						"delta": map[string]any{
-							"type":     "thinking_delta",
-							"thinking": text,
-						},
-					})
-					t.reasoningText[event.Item.ID] += text
+				t.emitReasoningSnapshot(event.Item.ID, joinReasoningText(eventItemToOutput(*event.Item)))
+			case "message":
+				for contentIndex, content := range event.Item.Content {
+					if content.Type != "output_text" {
+						continue
+					}
+					t.emitTextSnapshot(textBlockKey(event.Item.ID, contentIndex), content.Text)
 				}
 			}
 		}
@@ -3959,12 +4224,7 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 		})
 	case "response.function_call_arguments.done":
 		if t.closedToolBlocks[event.ItemID] {
-			current := strings.TrimSpace(t.toolArguments[event.ItemID])
-			incoming := strings.TrimSpace(fallback(event.Delta, event.Arguments))
-			if incoming == "" || incoming == current {
-				return nil
-			}
-			return fmt.Errorf("duplicate function_call_arguments.done with conflicting arguments")
+			return t.acceptLateClosedToolArguments(event.ItemID, fallback(event.Delta, event.Arguments), "response.function_call_arguments.done")
 		}
 		callID := fallback(event.ItemID, "tool_missing")
 		index := t.startToolBlock(event.ItemID, callID, t.toolNames[event.ItemID])
@@ -3991,35 +4251,16 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 			t.closedToolBlocks[event.ItemID] = true
 		}
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-		index := t.startThinkingBlock(event.ItemID)
-		t.reasoningText[event.ItemID] += event.Delta
-		t.writeEvent("content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": index,
-			"delta": map[string]any{
-				"type":     "thinking_delta",
-				"thinking": event.Delta,
-			},
-		})
+		t.appendReasoningDelta(event.ItemID, event.Delta)
 	case "response.reasoning_text.done", "response.reasoning_summary_text.done":
-		if strings.TrimSpace(event.Text) != "" && strings.TrimSpace(t.reasoningText[event.ItemID]) == "" {
-			index := t.startThinkingBlock(event.ItemID)
-			t.reasoningText[event.ItemID] = event.Text
-			t.writeEvent("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": index,
-				"delta": map[string]any{
-					"type":     "thinking_delta",
-					"thinking": event.Text,
-				},
-			})
-		}
+		t.emitReasoningSnapshot(event.ItemID, event.Text)
 	case "response.output_item.done":
 		if event.Item != nil {
 			switch event.Item.Type {
 			case "reasoning":
+				t.emitReasoningSnapshot(event.Item.ID, joinReasoningText(eventItemToOutput(*event.Item)))
 				carrier := encodeReasoningCarrier(eventItemToOutput(*event.Item))
-				if strings.TrimSpace(t.reasoningText[event.Item.ID]) != "" {
+				if strings.TrimSpace(t.currentReasoningText(event.Item.ID)) != "" {
 					index := t.startThinkingBlock(event.Item.ID)
 					if carrier != "" {
 						t.writeEvent("content_block_delta", map[string]any{
@@ -4052,7 +4293,7 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 					break
 				}
 				index := t.startThinkingBlock(event.Item.ID)
-				if strings.TrimSpace(t.reasoningText[event.Item.ID]) == "" {
+				if strings.TrimSpace(t.currentReasoningText(event.Item.ID)) == "" {
 					t.writeEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
 						"index": index,
@@ -4061,7 +4302,7 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 							"thinking": defaultThinkingText,
 						},
 					})
-					t.reasoningText[event.Item.ID] = defaultThinkingText
+					t.setReasoningBuffer(event.Item.ID, defaultThinkingText)
 				}
 				t.writeEvent("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
@@ -4079,6 +4320,12 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 					t.closedReasoning[event.Item.ID] = true
 				}
 			case "function_call":
+				if t.closedToolBlocks[event.Item.ID] {
+					if err := t.acceptLateClosedToolArguments(event.Item.ID, event.Item.Arguments, "response.output_item.done"); err != nil {
+						return err
+					}
+					break
+				}
 				callID := fallback(event.Item.CallID, fallback(event.Item.ID, "tool_missing"))
 				index := t.startToolBlock(event.Item.ID, callID, event.Item.Name)
 				if err := t.validateToolArgumentsPayload(event.Item.ID, event.Item.Arguments); err != nil {
@@ -4103,26 +4350,12 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 				}
 			case "message":
 				for contentIndex, content := range event.Item.Content {
-					if content.Type != "output_text" || strings.TrimSpace(content.Text) == "" {
+					if content.Type != "output_text" {
 						continue
 					}
 					blockKey := textBlockKey(event.Item.ID, contentIndex)
-					index, ok := t.textBlocks[blockKey]
-					if !ok {
-						index = t.startTextBlock(blockKey)
-					}
-					if !t.textBlockHasDelta[blockKey] {
-						t.writeEvent("content_block_delta", map[string]any{
-							"type":  "content_block_delta",
-							"index": index,
-							"delta": map[string]any{
-								"type": "text_delta",
-								"text": content.Text,
-							},
-						})
-						t.textBlockHasDelta[blockKey] = true
-					}
-					if !t.closedTextBlocks[blockKey] {
+					t.emitTextSnapshot(blockKey, content.Text)
+					if index, ok := t.textBlocks[blockKey]; ok && !t.closedTextBlocks[blockKey] {
 						t.writeEvent("content_block_stop", map[string]any{
 							"type":  "content_block_stop",
 							"index": index,
@@ -4156,9 +4389,12 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 		t.writeEvent("message_stop", map[string]any{
 			"type": "message_stop",
 		})
-	case "response.failed":
+	case "response.failed", "response.error":
 		t.closeOpenBlocks()
 		message := "The response failed."
+		if event.Error != nil && strings.TrimSpace(event.Error.Message) != "" {
+			message = event.Error.Message
+		}
 		if event.Response != nil && event.Response.Error != nil && strings.TrimSpace(event.Response.Error.Message) != "" {
 			message = event.Response.Error.Message
 		}
@@ -4170,6 +4406,159 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 	}
 
 	return nil
+}
+
+func (t *sseTranslator) currentTextBlockText(blockKey string) string {
+	if builder, ok := t.textBlockBuffers[blockKey]; ok && builder != nil {
+		return builder.String()
+	}
+	return ""
+}
+
+func (t *sseTranslator) setTextBlockBuffer(blockKey, text string) {
+	builder := &strings.Builder{}
+	builder.WriteString(text)
+	t.textBlockBuffers[blockKey] = builder
+}
+
+func (t *sseTranslator) appendTextBuffer(blockKey, delta string) {
+	builder, ok := t.textBlockBuffers[blockKey]
+	if !ok || builder == nil {
+		builder = &strings.Builder{}
+		t.textBlockBuffers[blockKey] = builder
+	}
+	builder.WriteString(delta)
+}
+
+func (t *sseTranslator) currentReasoningText(itemID string) string {
+	if builder, ok := t.reasoningBuffers[itemID]; ok && builder != nil {
+		return builder.String()
+	}
+	return ""
+}
+
+func (t *sseTranslator) setReasoningBuffer(itemID, text string) {
+	builder := &strings.Builder{}
+	builder.WriteString(text)
+	t.reasoningBuffers[itemID] = builder
+}
+
+func (t *sseTranslator) appendReasoningBuffer(itemID, delta string) {
+	builder, ok := t.reasoningBuffers[itemID]
+	if !ok || builder == nil {
+		builder = &strings.Builder{}
+		t.reasoningBuffers[itemID] = builder
+	}
+	builder.WriteString(delta)
+}
+
+func (t *sseTranslator) appendTextDelta(blockKey, delta string) {
+	index := t.startTextBlock(blockKey)
+	t.writeEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]any{
+			"type": "text_delta",
+			"text": delta,
+		},
+	})
+	t.textBlockHasDelta[blockKey] = true
+	t.appendTextBuffer(blockKey, delta)
+}
+
+func (t *sseTranslator) emitTextSnapshot(blockKey, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	remainder := remainingSnapshotSuffix(t.currentTextBlockText(blockKey), text)
+	if remainder == "" {
+		if t.currentTextBlockText(blockKey) == "" {
+			t.setTextBlockBuffer(blockKey, text)
+		}
+		return
+	}
+	index := t.startTextBlock(blockKey)
+	t.writeEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]any{
+			"type": "text_delta",
+			"text": remainder,
+		},
+	})
+	t.textBlockHasDelta[blockKey] = true
+	t.setTextBlockBuffer(blockKey, text)
+}
+
+func (t *sseTranslator) appendReasoningDelta(itemID, delta string) {
+	index := t.startThinkingBlock(itemID)
+	t.appendReasoningBuffer(itemID, delta)
+	t.writeEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]any{
+			"type":     "thinking_delta",
+			"thinking": delta,
+		},
+	})
+}
+
+func (t *sseTranslator) emitReasoningSnapshot(itemID, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	remainder := remainingSnapshotSuffix(t.currentReasoningText(itemID), text)
+	if remainder == "" {
+		if t.currentReasoningText(itemID) == "" {
+			t.setReasoningBuffer(itemID, text)
+		}
+		return
+	}
+	index := t.startThinkingBlock(itemID)
+	t.writeEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]any{
+			"type":     "thinking_delta",
+			"thinking": remainder,
+		},
+	})
+	t.setReasoningBuffer(itemID, text)
+}
+
+func remainingSnapshotSuffix(current, full string) string {
+	switch {
+	case full == "":
+		return ""
+	case current == "":
+		return full
+	case full == current:
+		return ""
+	case strings.HasPrefix(full, current):
+		return full[len(current):]
+	default:
+		return full
+	}
+}
+
+func (t *sseTranslator) acceptLateClosedToolArguments(itemID, incoming, source string) error {
+	incoming = strings.TrimSpace(incoming)
+	current := strings.TrimSpace(t.toolArguments[itemID])
+	if incoming == "" || incoming == current {
+		return nil
+	}
+	if current != "" && strings.HasPrefix(incoming, current) {
+		if err := t.validateToolArgumentsPayload(itemID, incoming); err != nil {
+			return err
+		}
+		t.toolArguments[itemID] = incoming
+		t.debugfTool("stream tool accepted late closed arguments item_id=%q source=%q", itemID, source)
+		return nil
+	}
+	if source == "response.function_call_arguments.done" {
+		return fmt.Errorf("duplicate function_call_arguments.done with conflicting arguments")
+	}
+	return fmt.Errorf("%s with conflicting arguments after done", source)
 }
 
 func (t *sseTranslator) trackToolArgumentDelta(itemID, delta string) error {
@@ -4621,18 +5010,36 @@ func (a *streamAccumulator) handle(eventName, payload string) error {
 		item := a.ensureMessageOutput(event.ItemID)
 		item.Content = setOutputTextContent(item.Content, event.ContentIndex, text, "output_text")
 	case "response.content_part.added":
-		if event.Part != nil && event.Part.Type == "output_text" && strings.TrimSpace(event.Part.Text) != "" {
-			key := textBlockKey(event.ItemID, event.ContentIndex)
-			if a.textParts[key] == "" {
-				a.textParts[key] = event.Part.Text
+		if event.Part != nil && strings.TrimSpace(event.Part.Text) != "" {
+			switch event.Part.Type {
+			case "output_text":
+				key := textBlockKey(event.ItemID, event.ContentIndex)
+				if a.textParts[key] == "" {
+					a.textParts[key] = event.Part.Text
+				}
+				item := a.ensureMessageOutput(event.ItemID)
+				item.Content = setOutputTextContent(item.Content, event.ContentIndex, a.textParts[key], "output_text")
+			case "reasoning_text", "summary_text":
+				if a.reasoning[event.ItemID] == "" {
+					a.reasoning[event.ItemID] = event.Part.Text
+				}
+				item := a.ensureReasoningOutput(event.ItemID)
+				item.Content = setOutputTextContent(item.Content, 0, a.reasoning[event.ItemID], event.Part.Type)
 			}
-			item := a.ensureMessageOutput(event.ItemID)
-			item.Content = setOutputTextContent(item.Content, event.ContentIndex, a.textParts[key], "output_text")
 		}
 	case "response.content_part.done":
-		if event.Part != nil && event.Part.Type == "output_text" {
-			item := a.ensureMessageOutput(event.ItemID)
-			item.Content = setOutputTextContent(item.Content, event.ContentIndex, event.Part.Text, "output_text")
+		if event.Part != nil {
+			switch event.Part.Type {
+			case "output_text":
+				item := a.ensureMessageOutput(event.ItemID)
+				item.Content = setOutputTextContent(item.Content, event.ContentIndex, fallback(event.Text, event.Part.Text), "output_text")
+			case "reasoning_text", "summary_text":
+				text := fallback(event.Text, event.Part.Text)
+				if text != "" {
+					item := a.ensureReasoningOutput(event.ItemID)
+					item.Content = setOutputTextContent(item.Content, 0, text, event.Part.Type)
+				}
+			}
 		}
 	case "response.function_call_arguments.delta":
 		a.argParts[event.ItemID] += event.Delta
@@ -4655,9 +5062,15 @@ func (a *streamAccumulator) handle(eventName, payload string) error {
 			item := a.ensureReasoningOutput(event.ItemID)
 			item.Content = setOutputTextContent(item.Content, 0, text, "reasoning_text")
 		}
-	case "error":
-		if event.Error != nil {
+	case "error", "response.error":
+		if event.Error != nil && strings.TrimSpace(event.Error.Message) != "" {
 			return errors.New(event.Error.Message)
+		}
+		if event.Response != nil {
+			a.mergeResponse(*event.Response)
+			if event.Response.Error != nil && strings.TrimSpace(event.Response.Error.Message) != "" {
+				return errors.New(event.Response.Error.Message)
+			}
 		}
 	}
 
@@ -4825,10 +5238,10 @@ func (p *Proxy) forwardBackendError(w http.ResponseWriter, resp *http.Response) 
 }
 
 func estimateInputTokens(system any, messages []AnthropicMessage, tools []AnthropicTool) int {
-	var totalChars int
+	var totalUnits float64
 
 	addString := func(value string) {
-		totalChars += len([]rune(value))
+		totalUnits += estimateStringTokenUnits(value)
 	}
 
 	if blocks, err := normalizeSystemBlocks(system); err == nil {
@@ -4877,11 +5290,41 @@ func estimateInputTokens(system any, messages []AnthropicMessage, tools []Anthro
 		}
 	}
 
-	if totalChars == 0 {
+	if totalUnits == 0 {
 		return 0
 	}
 
-	return int(math.Ceil(float64(totalChars) / 4.0))
+	return int(math.Ceil(totalUnits))
+}
+
+func estimateStringTokenUnits(value string) float64 {
+	if value == "" {
+		return 0
+	}
+	var asciiLetters int
+	var digits int
+	var whitespace int
+	var punctuation int
+	var nonASCII int
+	for _, r := range value {
+		switch {
+		case unicode.IsSpace(r):
+			whitespace++
+		case r > unicode.MaxASCII:
+			nonASCII++
+		case unicode.IsLetter(r):
+			asciiLetters++
+		case unicode.IsDigit(r):
+			digits++
+		default:
+			punctuation++
+		}
+	}
+	units := float64(asciiLetters+digits)/4.0 + float64(punctuation)/3.0 + float64(whitespace)/8.0 + float64(nonASCII)
+	if units == 0 {
+		return 0
+	}
+	return units
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errorType, message string) {
@@ -4956,6 +5399,8 @@ func inferModelFamily(model string) string {
 		return "gpt-5"
 	case strings.HasPrefix(lower, "gpt-4"):
 		return "gpt-4"
+	case strings.HasPrefix(lower, "o1"), strings.HasPrefix(lower, "o3"), strings.HasPrefix(lower, "o4"):
+		return "o-series"
 	case strings.HasPrefix(lower, "claude"):
 		return "claude"
 	default:

@@ -15,6 +15,17 @@
 
 该参考仓库虽面向 GitHub Copilot，但其中有不少 **Claude Code 语义兼容层** 是通用可迁移的。
 
+结合当前仓库的 `README.md`、`internal/claudecodexproxy/config.go` 与 `internal/claudecodexproxy/proxy.go`，可以先明确一个现实基线：
+
+- 当前仓库的**运维/接入基线**已经不只是“能转协议”
+- 已经形成了：
+  - Codex / Claude Code 配置发现与后端 fallback
+  - 非 loopback 监听下的 client API key 鉴权
+  - metadata / continuity / `prompt_cache_key` 的隐私分级开关
+  - Docker / 本地运行的文档化接入路径
+
+因此，这份迁移计划后续应把重心继续放在 **通用协议语义、能力探测、流式稳定性、continuity 保真** 上，而不是把大量精力重新投入到部署包装层。
+
 ---
 
 ## 通用桥接目标
@@ -291,15 +302,17 @@
   - structured `function_call_output.output` unsupported → 自动降级为文本 output
   - backend `stream=true` unsupported → 自动改走 backend JSON，再翻成 Anthropic SSE
   - request model passthrough unsupported → 自动探测 `/v1/models`，选择 preferred backend model 重试并 sticky 使用
+  - round-trip history item persistence unsupported → 首次失败后在同一 backend-model scope 内 sticky disable 持久化历史项 `id`，并以 strip-id 形态重试
 - 当前实现是 **generic capability probing**，不是 rawchat 专属逻辑
 
 剩余风险：
 
 - 当前 capability state 已从“单一全局 sticky”收口到 **request-model / configured-backend-model 作用域**；更进一步仍可继续升级成 backend family / effective backend model 分桶
 - 仍以错误文案匹配为主，后续可继续升级为结构化 error classifier + TTL/re-probe
+- `input item persistence` 已纳入 backend-model scoped capability 与 TTL/reprobe；后续若需要可继续与更多 provider 错误分类或更细分的 history item family 收口
 - 当前仓库已完成 TTL-reprobe 第一轮最小落地：
   - `CLAUDE_CODE_PROXY_CAPABILITY_REPROBE_TTL`
-  - 对 `metadata`、`reasoning`、`reasoning_include`、`phase`、`stream`、`structured_output`、`prompt_cache_key`、`context_management`、`compaction_input`、`model passthrough` 启用过期后自然重探
+  - 对 `metadata`、`reasoning`、`reasoning_include`、`phase`、`stream`、`structured_output`、`prompt_cache_key`、`context_management`、`compaction_input`、`input_item_persistence`、`model passthrough` 启用过期后自然重探
   - 仍不把 `parallel_tool_calls` / thinking budget / profile limit 这类 preflight 项写进 TTL 状态
  - 当前仓库已完成 TTL-reprobe 第二轮最小落地：
    - 通过 `reprobeUntil` lease 侧表实现 single-leader reprobe
@@ -308,7 +321,7 @@
 
 ---
 
-## 2026-04-16 对照参考仓库后的新增迁移判断
+## 2026-04-20 结合当前仓库实现后的新增迁移判断
 
 在 `responses` 本体翻译、tool_result 兼容、stream fallback、`/v1/models` fallback、count_tokens 基础链路之外，当前最值得继续从参考仓库吸收的能力已经不再是“再堆一层基础翻译”，而是以下通用增强。
 
@@ -363,6 +376,9 @@
      - 仍然受现有 `metadata` capability 控制，不额外引入逐字段 retry
      - 不再把 raw `metadata.user_id`、raw `x-claude-code-session-id`、raw marker session 直接镜像进 backend metadata
      - metadata value 已做基础 trim / 截断 / 控制字符清洗
+   - 当前仓库已完成第三轮最小落地：
+     - continuity 派生值与外发 metadata projection 已分层收口
+     - `buildMetadata(...)` 不再直接展开 continuity 投影细节，而是通过独立 projection helper 落地
    - 下一步剩余重点：
      - 评估是否需要为 long-running team / task 流程补更多 continuity header/field
      - 把 continuity metadata 从 `claude_code_*` 前缀进一步抽象成更稳定的 bridge schema（如后续确有必要）
@@ -379,9 +395,13 @@
    - 当前仓库已完成第二轮最小落地：
      - `anthropic-beta + no tools + non-compact` 请求的 warmup model 路由
      - `BackendWarmupModel` 与 `/v1/models` 推断 `WarmupModel` 的最小联动
+   - 当前仓库已完成第三轮最小落地：
+     - warmup-like 请求收紧为更保守的单轮纯文本判定
+     - 带 compaction carrier、多轮文本历史、带 system 指令的请求不再误走 warmup
+     - warmup / compact / compaction-carrier 请求会提前 prime model profiles，降低 warmup model profile 不兼容时的误路由
    - 仍待继续：
      - compact / auto-continue 与 model-driven capability init 的联动策略
-     - 更细的 warmup-like 启发式与误判控制
+     - 更细的 warmup-like 启发式只在确有收益时谨慎推进，避免重新放大误判面
 
 3. **model-driven capability initialization**
    - 不只把 `/v1/models` 当 fallback 数据源
@@ -417,8 +437,8 @@
 ### 中优先级
 
 1. **stream runaway guard**
-   - 为异常 `function_call_arguments.delta` / 空白 runaway 增量添加保护
-   - 当前仓库已完成第一轮最小实现：连续空白参数增量超过阈值时中止流并返回 error event
+   - 为异常 `function_call_arguments.delta` flood、超大参数、顺序冲突等流式异常添加保护
+   - 当前仓库已完成第一轮最小实现：保留空 delta flood / 超大参数 / 顺序冲突等保护；空白参数增量按原样透传，避免误杀合法流式 JSON 片段
    - 当前仓库已完成第二轮最小实现：
      - `delta after done` 直接报错
      - 超大 tool 参数累计直接报错
@@ -427,6 +447,9 @@
      - `excessive empty delta flood` 显式测试
      - `output_item.done` 单包超大参数保护
      - “合法长参数流不误杀”正向测试
+   - 当前仓库已完成第四轮最小实现：
+     - 首个 `response.function_call_arguments.done` 与已累计 delta 冲突时显式报错
+     - late-closed `output_item.added` / `output_item.done` 参数在可接受扩展场景下不误报
    - 后续仍可继续扩成更细的 tool/block 级异常流保护（如更细 provider 顺序兼容）
 
 2. **compaction / context carrier**
@@ -435,6 +458,7 @@
      - OpenAI `output[].type="compaction"` 可回转为 Anthropic `thinking` block（非流式 / 流式 fallback 均已覆盖）
      - latest compaction input shrinking 已和 `context_management` 注入解耦；后端不支持 `context_management` 时仍保留 shrinking
      - 若后端不支持 `input[].type="compaction"`，会在同一 backend-model scope 内禁用 compaction input，并把最新 compaction carrier 降级为 `reasoning` carrier 后重试
+     - `input[n].type` / enum / expected-values 风格的 provider 报错已纳入 compaction input fallback 分类
    - 后续仍可继续增强：
      - compaction input fallback 的更多 provider 错误文案识别
      - 完全不支持 reasoning input 的更弱 text/omit fallback 策略（需谨慎，避免泄漏或语义污染）
@@ -445,7 +469,9 @@
 
 4. **更精细的 token fallback estimator**
    - 继续保留 Anthropic exact count 优先
-   - 但当 exact count 不可用时，fallback 可以更贴近真实 tokenizer 行为
+   - 当前仓库已完成第一轮最小落地：
+     - fallback estimator 已从纯字符粗略估算推进到更细粒度 token-unit 近似
+     - `count_tokens` fallback 路径增加了 tool overhead / multiplier 的 debug 观测
 
 ### 低优先级
 
@@ -531,28 +557,301 @@
 
 ---
 
-## 推荐迁移顺序
+## 推荐迁移顺序（执行清单版）
 
-### 第一阶段（已基本完成）
+下面把迁移计划改写成更适合持续跟踪的任务清单。
 
-1. `count_tokens` 特殊处理
-2. `prepareMessagesApiPayload` 核心兼容逻辑
-3. runtime capability probing / automatic downgrade
-4. `/v1/models` passthrough + synthetic fallback
+### Phase 1：基线能力（已基本完成）
 
-### 第二阶段（建议下一批）
+- [x] `count_tokens` 特殊处理
+- [x] `prepareMessagesApiPayload` 核心兼容逻辑
+- [x] runtime capability probing / automatic downgrade
+- [x] `/v1/models` passthrough + synthetic fallback
+- [x] IDE/tool sanitize
 
-1. session / subagent continuity（第一轮已落地，继续补 interaction continuity）
-2. compact / warmup / auto-continue 降本预处理（第二轮最小 warmup routing 已落地，继续补 compact 联动）
-3. model-driven capability initialization（第一轮已落地，继续补 limits / endpoint 粒度）
-4. IDE/tool sanitize（已落地）
+完成标志：
 
-### 第三阶段（增强项）
+- Claude Code 基本 messages/tool/MCP 流程可跑通
+- 后端不支持 `metadata` / `reasoning` / `phase` / `stream` / structured tool output 时可自动降级
+- `/v1/models` 与 `count_tokens` 都有 fallback 路径
 
-1. 更完整的流式异常保护
-2. compaction / context carrier
-3. 更细粒度 observability / TTL / re-probe
-4. 更精细的 token fallback estimator
+### Phase 2：连续性与模型路由（建议优先推进）
+
+#### Task 2.1：session / subagent continuity 第二轮收口
+
+目标：
+
+- 让 team / task / subagent / compact 请求链路拥有更稳定的 continuity 语义
+
+具体事项：
+
+- [ ] 评估 long-running team / task 是否还需要补充 continuity header/field
+- [ ] 明确哪些 continuity 字段应继续保留在 `claude_code_*` 命名下，哪些值得抽象成更稳定的 bridge schema
+- [ ] 补齐对应测试，覆盖 session affinity / parent session / interaction id 续接场景
+
+完成判定：
+
+- 长链路 agent/team 请求在后端侧具有稳定关联信息
+- continuity 语义与隐私开关边界不冲突
+
+#### Task 2.2：model-driven capability initialization 第二轮增强
+
+目标：
+
+- 进一步减少首次 unsupported retry，提升模型选择与 payload 初值准确度
+
+具体事项：
+
+- [ ] 继续细化 `supported_endpoints` / `capabilities.supports.*` 的 pre-disable 初始化
+- [ ] 评估 endpoint/profile 粒度是否需要继续细分
+- [ ] 继续补 `limits` 驱动的 request shaping / model eligibility 测试
+- [ ] 明确 `PreferredModel` 是否只保留保守 fallback，不扩成激进 best-fit router
+
+完成判定：
+
+- 常见兼容后端首次请求即更接近可接受 payload
+- warmup model 与正式 model 的 capability 污染被持续隔离
+
+#### Task 2.3：compact / warmup / auto-continue 第三轮增强
+
+目标：
+
+- 继续把降本预处理做成通用 bridge 能力，而不是站点特化逻辑
+
+具体事项：
+
+- [ ] 细化 warmup-like 请求识别与误判控制
+- [ ] 评估 compact / auto-continue 与 model capability init 的联动策略
+- [ ] 补齐 compact `skipLastMessage`、warmup model routing、非 warmup 请求不误路由的回归测试
+
+完成判定：
+
+- warmup 降本收益可持续保留
+- 普通请求不会被误导向小模型或过度裁剪 payload
+
+### Phase 3：稳定性与语义保真（增强项）
+
+#### Task 3.1：compaction / context carrier 收口
+
+- [ ] 继续扩充 `compaction input` unsupported 的 provider 错误识别
+- [ ] 谨慎评估完全不支持 reasoning input 时的更弱 fallback（text / omit）
+- [ ] 补齐 compaction input / output / fallback 的端到端测试矩阵
+
+完成判定：
+
+- compaction carrier 在支持与不支持该语义的后端上都能稳定落地或安全降级
+
+#### Task 3.2：stream/tool 异常保护与 round-trip history fallback 收口
+
+- [ ] 继续增强 tool/block 级顺序异常保护
+- [ ] 评估 `input item persistence` 是否升级成 scoped capability state，而不只停留在单请求自愈 fallback
+- [ ] 补齐异常流、provider 顺序偏差、历史项 id 剥离后的回归测试
+
+完成判定：
+
+- 流式异常不会轻易打断正常会话
+- round-trip history fallback 在行为稳定的后端上可预测、可观测
+
+#### Task 3.3：observability / TTL / token fallback estimator
+
+- [ ] 继续细化 error classifier 与 TTL / reprobe 策略
+- [ ] 增加更面向 feature scope 的 debug / trace 观测点
+- [ ] 在保留 Anthropic exact count 优先的前提下，改进 fallback estimator
+
+完成判定：
+
+- unsupported feature 的重探行为更可解释
+- token fallback 与真实 tokenizer 的偏差进一步收敛
+
+### 建议执行顺序（简版）
+
+1. Task 2.1 session / subagent continuity 第二轮收口
+2. Task 2.2 model-driven capability initialization 第二轮增强
+3. Task 2.3 compact / warmup / auto-continue 第三轮增强
+4. Task 3.1 compaction / context carrier 收口
+5. Task 3.2 stream/tool 异常保护与 round-trip history fallback 收口
+6. Task 3.3 observability / TTL / token fallback estimator
+
+### 对应到当前仓库的实际 todo（可直接开工）
+
+下面把上面的阶段任务进一步映射到当前仓库中的主要落点，方便直接拆 issue / PR。
+
+#### Todo A：continuity 语义第二轮收口
+
+主要落点：
+
+- `internal/claudecodexproxy/proxy.go`
+  - `deriveContinuityContext(...)`
+  - `deriveSessionAffinity(...)`
+  - `deriveParentSessionID(...)`
+  - `deriveInteractionType(...)`
+  - `deriveInteractionID(...)`
+  - `buildBackendRequestWithOptions(...)`
+- `internal/claudecodexproxy/proxy_test.go`
+  - 已有 continuity 基线测试可继续扩：
+    - `TestBuildBackendRequestDerivesContinuityMetadataFromSessionAndSubagent`
+    - `TestBuildBackendRequestAddsSecondWaveContinuityMetadata`
+    - `TestBuildBackendRequestDerivesCompactAutoContinueInteractionType`
+    - `TestHandleMessagesDoesNotSendContinuityMetadataWhenDisabled`
+
+直接 todo：
+
+- [x] 梳理现有 continuity 字段，把“内部稳定标识”和“外发 metadata 字段”明确分层
+- [ ] 评估 long-running team/task 是否还需要额外 continuity 载体
+- [ ] 为 interaction continuity 新增正向 + 隐私开关回归测试
+
+建议验收：
+
+- 打开/关闭 `DisableContinuityMetadata`、`AnonymousMode` 时，请求行为符合预期
+- subagent / compact / 普通 conversation 三类 interaction 都能稳定区分
+
+#### Todo B：model-driven capability initialization 第二轮增强
+
+主要落点：
+
+- `internal/claudecodexproxy/proxy.go`
+  - `seedCapabilitiesFromModels(...)`
+  - `extractBackendModelProfile(...)`
+  - `optionsForRequest(...)`
+  - `selectBackendModel(...)`
+  - `modelProfileSupportsRequest(...)`
+- `internal/claudecodexproxy/proxy_test.go`
+  - 已有模型能力初始化测试可继续扩：
+    - `TestBuildBackendRequestEnablesParallelToolCallsWhenProfileSupportsIt`
+    - `TestBuildBackendRequestDowngradesHighReasoningWhenMaxThinkingBudgetIsSmall`
+    - `TestBuildBackendRequestFallsBackWhenThinkingBudgetBelowProfileMinimum`
+    - `TestHandleMessagesSetsParallelToolCallsWhenFetchedProfileAllows`
+    - `TestHandleMessagesCapsReasoningEffortWhenFetchedMaxThinkingBudgetTooLow`
+
+直接 todo：
+
+- [ ] 继续细化 `supported_endpoints` / `capabilities.supports.*` 到请求初值的映射
+- [ ] 明确 `PreferredModel` 的边界：仅保守 fallback，还是允许更积极的 best-fit 选择
+- [ ] 补齐 profile-driven request shaping 与 model fallback 的回归测试矩阵
+
+建议验收：
+
+- 常见不兼容字段能在首次请求前就被预裁剪
+- warmup model 的能力状态不会污染正式模型
+
+#### Todo C：compact / warmup / auto-continue 第三轮增强
+
+主要落点：
+
+- `internal/claudecodexproxy/proxy.go`
+  - `detectCompactType(...)`
+  - `isWarmupRequest(...)`
+  - `resolveWarmupModel(...)`
+  - `mergeToolResultForClaude(...)`
+- `internal/claudecodexproxy/proxy_test.go`
+  - `TestBuildBackendRequestSkipsLastMergeForCompactRequest`
+  - `TestBuildBackendRequestRoutesWarmupNoToolsAnthropicBetaToWarmupModel`
+  - `TestBuildBackendRequestDoesNotUseWarmupModelForOrdinaryRequests`
+  - `TestHandleMessagesRoutesWarmupRequestsToConfiguredWarmupModel`
+  - `TestHandleMessagesDoesNotRouteWarmupModelForCompactRequests`
+
+直接 todo：
+
+- [x] 收紧 warmup-like 请求识别条件，减少误判
+- [x] 评估 compact / auto-continue 与 capability init 的联动顺序
+- [x] 为普通请求误路由、小模型污染、compact 合并边界继续补测试
+
+建议验收：
+
+- warmup 只命中预期场景
+- compact 与 auto-continue 不会破坏 tool_result 合并和后续续接语义
+
+#### Todo D：compaction / context carrier 收口
+
+主要落点：
+
+- `internal/claudecodexproxy/proxy.go`
+  - `compactInputByLatestCompaction(...)`
+  - `downgradeCompactionInputItems(...)`
+  - `dropCompactionInputItems(...)`
+  - `requestContainsCompactionCarrier(...)`
+- `internal/claudecodexproxy/proxy_test.go`
+  - `TestBuildBackendRequestConvertsCompactionCarrier`
+  - `TestBuildBackendRequestInjectsContextManagementCompactionWhenProfileAllows`
+  - `TestBuildBackendRequestKeepsOnlyLatestCompactionAndFollowingItems`
+  - `TestHandleMessagesRetriesWithDowngradedCompactionInputAfterUnsupportedType`
+  - `TestHandleMessagesContextManagementTTLReprobeStillKeepsLatestCompactionShrinking`
+
+直接 todo：
+
+- [x] 扩充 `compaction input unsupported` 的错误识别文案
+- [ ] 评估 reasoning input 完全不可用时的最弱安全降级策略
+- [ ] 补齐 compaction input/output/fallback 的端到端场景
+
+建议验收：
+
+- compaction carrier 在支持/不支持后端都能稳定工作或安全降级
+- latest compaction shrinking 不因 capability fallback 而失效
+
+#### Todo E：stream/tool 异常保护与 persisted-history fallback 收口
+
+主要落点：
+
+- `internal/claudecodexproxy/proxy.go`
+  - `sseTranslator.trackToolArgumentDelta(...)`
+  - `classifyCapabilityFailure(...)`
+  - `requestUsesRoundTripHistoryItems(...)`
+  - `matchesInputItemPersistenceFailure(...)`
+- `internal/claudecodexproxy/proxy_test.go`
+  - `TestHandleMessagesStreamAllowsWhitespaceOnlyFunctionCallArgumentDeltas`
+  - `TestHandleMessagesStreamRejectsDeltaAfterToolDone`
+  - `TestHandleMessagesStreamRejectsOversizedToolArguments`
+  - `TestHandleMessagesStreamRejectsExcessiveEmptyDeltaFlood`
+  - `TestHandleMessagesRetriesWithoutPersistedHistoryIDsAfterStatelessSessionError`
+
+直接 todo：
+
+- [x] 收口 `input item persistence` 为 scoped capability state，并补 sticky disable / TTL 回归测试
+- [x] 补齐“首个 done 与已累计 delta 冲突”的异常流回归测试
+- [ ] 继续补 provider 顺序偏差等更细粒度的异常流测试
+
+建议验收：
+
+- 合法长参数流、空白 JSON 片段、done 扩展前缀等场景不误报
+- 真正异常的 delta flood / oversized / after-done 冲突能稳定拦截
+
+#### Todo F：observability / TTL / token fallback estimator
+
+主要落点：
+
+- `internal/claudecodexproxy/proxy.go`
+  - `effectiveCapabilityStateLocked(...)`
+  - `setCapabilityCooldownLocked(...)`
+  - `clearCapabilityCooldownLocked(...)`
+  - `countTokensViaAnthropic(...)`
+  - token fallback / debug 输出相关逻辑
+- `internal/claudecodexproxy/config.go`
+  - `CapabilityReprobeTTL` 配置项
+- `internal/claudecodexproxy/proxy_test.go`
+  - `TestHandleMessagesStreamTTLReprobeUsesSingleLeaderAndKeepsAnthropicSSE`
+  - `TestHandleMessagesAnonymousModeDoesNotConsumePromptCacheKeyTTLReprobeLease`
+
+直接 todo：
+
+- [ ] 继续细化 error classifier，减少纯字符串匹配的脆弱性
+- [x] 增加按 feature scope 观察 TTL / reprobe 行为的调试信息
+- [x] 改进 fallback token estimator，同时保持 Anthropic exact count 优先
+
+建议验收：
+
+- capability 降级、冷却、重探路径更易解释
+- token 估算在 MCP / Skill / tool-heavy 请求下更稳定
+
+#### 推荐拆分方式
+
+如果要按小步提交推进，建议拆成 6 个独立 PR：
+
+1. PR-1：continuity 收口
+2. PR-2：model capability init 第二轮增强
+3. PR-3：warmup / compact 第三轮增强
+4. PR-4：compaction / context carrier 收口
+5. PR-5：stream/tool guard + persisted-history fallback 收口
+6. PR-6：observability / TTL / token estimator
 
 ---
 
@@ -574,20 +873,22 @@
 
 ## 当前判断
 
-从最近日志与真实 E2E 看，当前 bridge 已经跨过：
+从当前仓库代码、README、真实 E2E 与本轮回归测试看，当前 bridge 已经跨过：
 
 1. MCP 工具调用可用
 2. `TeamCreate` / `Agent` / `SendMessage` / `TeamDelete` 链路可用
-3. runtime capability probing 的第一轮高价值降级项可用
+3. runtime capability probing 的高价值降级项已具备 backend-scope sticky disable + TTL/reprobe
+4. 配置发现、client 鉴权、隐私分级开关已经形成稳定的接入基线
+5. warmup / compact / compaction / stream guard / persisted-history fallback 已完成一轮实装与验收
 
-因此，下一步最值得继续迁移的不再是 rawchat 专属兼容，而是：
+因此，后续最值得继续推进的事项已经收敛为：
 
-1. **session continuity 的第二轮增强（interaction/session affinity）**
-2. **model-driven capability initialization 的第二轮增强（limits / endpoint 粒度）**
-3. **compact / warmup / auto-continue 的第三轮增强（更细的 warmup-like 启发式）**
-4. **compaction / context carrier**
-5. **更细粒度的 stream/tool 异常保护**
+1. **continuity 的剩余增强**：是否还需要 long-running team/task 的额外 continuity 载体
+2. **model-driven capability init 的细粒度收口**：更细 endpoint/profile 初始化，但继续保持保守 fallback
+3. **compaction 的更弱降级策略**：仅在确有必要时评估 text / omit 路径
+4. **stream/provider 顺序兼容**：补更细粒度 provider 顺序偏差测试，而不是继续放宽主逻辑
+5. **error classifier 结构化升级**：逐步减少纯字符串匹配依赖
 
 也就是说，路线已经从“让 Claude Code 能跑起来”进入：
 
-> **让通用 OpenAI-format backend 在 Claude Code / agent team / MCP 场景下跑得更稳、更省、更可持续。**
+> **让通用 OpenAI-format backend 在 Claude Code / agent team / MCP 场景下持续稳定运行，并把剩余边角兼容问题收敛成更小、更明确的增量工作。**
