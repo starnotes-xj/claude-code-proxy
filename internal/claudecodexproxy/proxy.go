@@ -20,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 )
 
 const (
@@ -61,6 +60,7 @@ var (
 type Proxy struct {
 	cfg              Config
 	httpClient       *http.Client
+	streamHTTPClient *http.Client
 	idCounter        uint64
 	capsMu           sync.RWMutex
 	caps             runtimeCapabilities
@@ -183,6 +183,7 @@ func New(cfg Config) *Proxy {
 		httpClient: &http.Client{
 			Timeout: cfg.RequestTimeout,
 		},
+		streamHTTPClient: &http.Client{},
 		caps: runtimeCapabilities{
 			SupportedModels: map[string]struct{}{},
 			ModelProfiles:   map[string]backendModelProfile{},
@@ -914,13 +915,10 @@ func isWarmupRequest(req AnthropicMessagesRequest, headers http.Header, compactT
 	if len(req.Tools) > 0 || req.ToolChoice != nil {
 		return false
 	}
-	if len(req.Messages) != 1 {
+	if features.hasVisionInput || features.hasToolResultHistory {
 		return false
 	}
-	if features.hasSystemInstructions || features.hasVisionInput || features.hasToolResultHistory || features.hasCompactionCarrier {
-		return false
-	}
-	return features.warmupCandidateText != ""
+	return len(req.Messages) > 0
 }
 
 func (p *Proxy) shouldPrimeModelProfiles(req AnthropicMessagesRequest, headers http.Header, features requestFeatures) bool {
@@ -931,13 +929,13 @@ func (p *Proxy) shouldPrimeModelProfiles(req AnthropicMessagesRequest, headers h
 	if caps.ModelsFetched {
 		return false
 	}
-	compactType := detectCompactType(req)
-	return req.Stream ||
-		len(req.Tools) > 0 ||
-		p.resolveBackendReasoning(req) != nil ||
-		isWarmupRequest(req, headers, compactType, features) ||
-		compactType != compactNone ||
-		features.hasCompactionCarrier
+	if features.hasCompactionCarrier || features.hasRoundTripHistory {
+		return true
+	}
+	if strings.TrimSpace(p.cfg.BackendWarmupModel) != "" && isWarmupRequest(req, headers, detectCompactType(req), features) {
+		return false
+	}
+	return req.Stream || len(req.Tools) > 0 || p.resolveBackendReasoning(req) != nil || isWarmupRequest(req, headers, detectCompactType(req), features)
 }
 
 func modelProfileSupportsRequest(profile backendModelProfile, req AnthropicMessagesRequest) bool {
@@ -1214,9 +1212,7 @@ func (p *Proxy) effectiveCapabilityStateLocked(scopeKey, feature string, state c
 	if p.cfg.RequestTimeout > 0 && p.cfg.RequestTimeout < leaseTTL {
 		leaseTTL = p.cfg.RequestTimeout
 	}
-	leaseUntil := p.now().Add(leaseTTL)
-	p.reprobeUntil[leaseKey] = leaseUntil
-	p.debugf("capability feature=%s scope=%q cooldown expired; reprobe lease until=%s", feature, scopeKey, leaseUntil.Format(time.RFC3339))
+	p.reprobeUntil[leaseKey] = p.now().Add(leaseTTL)
 	return capabilityUnknown
 }
 
@@ -1230,15 +1226,8 @@ func (p *Proxy) setCapabilityCooldownLocked(scopeKey, feature string) {
 }
 
 func (p *Proxy) clearCapabilityCooldownLocked(scopeKey, feature string) {
-	cooldownKey := capabilityCooldownKey(scopeKey, feature)
-	leaseKey := capabilityReprobeLeaseKey(scopeKey, feature)
-	_, hadCooldown := p.unsupportedUntil[cooldownKey]
-	_, hadLease := p.reprobeUntil[leaseKey]
-	delete(p.unsupportedUntil, cooldownKey)
-	delete(p.reprobeUntil, leaseKey)
-	if hadCooldown || hadLease {
-		p.debugf("capability feature=%s scope=%q restored", feature, scopeKey)
-	}
+	delete(p.unsupportedUntil, capabilityCooldownKey(scopeKey, feature))
+	delete(p.reprobeUntil, capabilityReprobeLeaseKey(scopeKey, feature))
 }
 
 func (p *Proxy) snapshotScopedCaps(scopeKey string, skipPromptCacheKeyReprobe, skipInputItemPersistenceReprobe bool) scopedRuntimeCapabilities {
@@ -1350,10 +1339,6 @@ func (p *Proxy) learnCapabilitiesFromRequest(opts backendRequestOptions, payload
 		if requestUsesCompactionInput(payload) {
 			scoped.CompactionInput = capabilitySupported
 			p.clearCapabilityCooldownLocked(opts.BackendCapabilityScopeKey, "compaction_input")
-		}
-		if requestUsesRoundTripHistoryItems(payload) {
-			scoped.InputItemPersistence = capabilitySupported
-			p.clearCapabilityCooldownLocked(opts.BackendCapabilityScopeKey, "input_item_persistence")
 		}
 		p.scopedCaps[opts.BackendCapabilityScopeKey] = scoped
 	}
@@ -1608,7 +1593,7 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 			return nil, OpenAIResponsesRequest{}, err
 		}
 
-		resp, err := p.httpClient.Do(req)
+		resp, err := p.backendHTTPClientFor(payload).Do(req)
 		if err != nil {
 			return nil, payload, err
 		}
@@ -1646,6 +1631,13 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 		opts = nextOpts
 	}
 	return nil, OpenAIResponsesRequest{}, fmt.Errorf("adaptive retry exhausted")
+}
+
+func (p *Proxy) backendHTTPClientFor(payload OpenAIResponsesRequest) *http.Client {
+	if payload.Stream && p.streamHTTPClient != nil {
+		return p.streamHTTPClient
+	}
+	return p.httpClient
 }
 
 func (p *Proxy) classifyCapabilityFailure(status int, body []byte, opts backendRequestOptions, payload OpenAIResponsesRequest) string {
@@ -2031,39 +2023,25 @@ func matchesParameterFailure(msg, param, observedParam string) bool {
 }
 
 func matchesCompactionInputFailure(msg, observedParam string, payload OpenAIResponsesRequest) bool {
-	messageHintsTypeFailure := strings.Contains(msg, "unsupported") ||
-		strings.Contains(msg, "invalid") ||
-		strings.Contains(msg, "unknown") ||
-		strings.Contains(msg, "unrecognized")
-	if strings.Contains(msg, "compaction") && messageHintsTypeFailure &&
-		(strings.Contains(msg, "input") || strings.Contains(msg, "item") || strings.Contains(msg, "type")) {
-		return true
+	param := strings.ToLower(strings.TrimSpace(observedParam))
+	if strings.HasPrefix(param, "input[") && strings.HasSuffix(param, "].type") {
+		start := strings.Index(param, "[")
+		end := strings.Index(param, "]")
+		if start >= 0 && end > start+1 {
+			if index, err := strconv.Atoi(param[start+1 : end]); err == nil && index >= 0 && index < len(payload.Input) {
+				if strings.EqualFold(strings.TrimSpace(payload.Input[index].Type), "compaction") {
+					return strings.Contains(msg, "unknown") ||
+						strings.Contains(msg, "unrecognized") ||
+						strings.Contains(msg, "unsupported") ||
+						strings.Contains(msg, "invalid") ||
+						strings.Contains(msg, "expected one of")
+				}
+			}
+		}
 	}
-	if !observedParamTargetsCompactionInput(payload, observedParam) {
-		return false
-	}
-	return messageHintsTypeFailure ||
-		strings.Contains(msg, "expected") ||
-		strings.Contains(msg, "allowed") ||
-		strings.Contains(msg, "valid") ||
-		strings.Contains(msg, "enum") ||
-		strings.Contains(msg, "one of")
-}
-
-func observedParamTargetsCompactionInput(payload OpenAIResponsesRequest, observedParam string) bool {
-	observedParam = strings.ToLower(strings.TrimSpace(observedParam))
-	if observedParam == "" {
-		return false
-	}
-	matches := regexp.MustCompile(`^input\[(\d+)\](?:\.type)?$`).FindStringSubmatch(observedParam)
-	if len(matches) != 2 {
-		return false
-	}
-	idx, err := strconv.Atoi(matches[1])
-	if err != nil || idx < 0 || idx >= len(payload.Input) {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(payload.Input[idx].Type), "compaction")
+	return strings.Contains(msg, "compaction") &&
+		(strings.Contains(msg, "unsupported") || strings.Contains(msg, "invalid") || strings.Contains(msg, "unknown") || strings.Contains(msg, "unrecognized") || strings.Contains(msg, "expected one of")) &&
+		(strings.Contains(msg, "input") || strings.Contains(msg, "item") || strings.Contains(msg, "type"))
 }
 
 func matchesInputItemPersistenceFailure(msg string) bool {
@@ -4224,7 +4202,12 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 		})
 	case "response.function_call_arguments.done":
 		if t.closedToolBlocks[event.ItemID] {
-			return t.acceptLateClosedToolArguments(event.ItemID, fallback(event.Delta, event.Arguments), "response.function_call_arguments.done")
+			current := strings.TrimSpace(t.toolArguments[event.ItemID])
+			incoming := strings.TrimSpace(fallback(event.Delta, event.Arguments))
+			if incoming == "" || incoming == current {
+				return nil
+			}
+			return fmt.Errorf("duplicate function_call_arguments.done with conflicting arguments")
 		}
 		callID := fallback(event.ItemID, "tool_missing")
 		index := t.startToolBlock(event.ItemID, callID, t.toolNames[event.ItemID])
@@ -4233,7 +4216,11 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 			return err
 		}
 		t.debugfTool("stream tool arguments item_id=%q call_id=%q name=%q arguments=%s", event.ItemID, callID, t.toolNames[event.ItemID], sanitizeLogValue(argumentsDelta))
-		if remainder := t.remainingToolArguments(event.ItemID, argumentsDelta); strings.TrimSpace(remainder) != "" {
+		remainder, err := t.remainingToolArguments(event.ItemID, argumentsDelta, "response.function_call_arguments.done")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(remainder) != "" {
 			t.writeEvent("content_block_delta", map[string]any{
 				"type":  "content_block_delta",
 				"index": index,
@@ -4331,7 +4318,11 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 				if err := t.validateToolArgumentsPayload(event.Item.ID, event.Item.Arguments); err != nil {
 					return err
 				}
-				if remainder := t.remainingToolArguments(event.Item.ID, event.Item.Arguments); strings.TrimSpace(remainder) != "" {
+				remainder, err := t.remainingToolArguments(event.Item.ID, event.Item.Arguments, "response.output_item.done")
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(remainder) != "" {
 					t.writeEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
 						"index": index,
@@ -4572,9 +4563,6 @@ func (t *sseTranslator) trackToolArgumentDelta(itemID, delta string) error {
 	t.toolEmptyDeltas[itemID] = 0
 	if strings.TrimSpace(delta) == "" && delta != "" {
 		t.toolWhitespaceRun[itemID] += len(delta)
-		if t.toolWhitespaceRun[itemID] > 20 {
-			return fmt.Errorf("excessive whitespace in function_call_arguments.delta")
-		}
 		t.toolArgumentBytes[itemID] += len(delta)
 		if t.toolArgumentBytes[itemID] > maxToolArgumentBytes {
 			return fmt.Errorf("oversized function_call_arguments")
@@ -4887,30 +4875,30 @@ func (t *sseTranslator) debugfTool(format string, args ...any) {
 	t.debugf(format, args...)
 }
 
-func (t *sseTranslator) remainingToolArguments(itemID, full string) string {
-	full = strings.TrimSpace(full)
-	if full == "" {
-		return ""
+func (t *sseTranslator) remainingToolArguments(itemID, full, source string) (string, error) {
+	if strings.TrimSpace(full) == "" {
+		return "", nil
 	}
 
 	current := t.toolArguments[itemID]
 	if current == "" {
 		t.toolArguments[itemID] = full
-		return full
+		return full, nil
 	}
 
 	if strings.HasPrefix(full, current) {
 		remainder := full[len(current):]
 		t.toolArguments[itemID] = full
-		return remainder
+		return remainder, nil
 	}
 
-	if full == current {
-		return ""
+	if full == current || strings.TrimSpace(full) == strings.TrimSpace(current) {
+		t.toolArguments[itemID] = full
+		return "", nil
 	}
 
 	t.debugfTool("tool argument mismatch item_id=%q current=%s full=%s", itemID, sanitizeLogValue(current), sanitizeLogValue(full))
-	return ""
+	return "", fmt.Errorf("%s does not match accumulated tool arguments", source)
 }
 
 type streamAccumulator struct {
@@ -5238,10 +5226,10 @@ func (p *Proxy) forwardBackendError(w http.ResponseWriter, resp *http.Response) 
 }
 
 func estimateInputTokens(system any, messages []AnthropicMessage, tools []AnthropicTool) int {
-	var totalUnits float64
+	var totalChars int
 
 	addString := func(value string) {
-		totalUnits += estimateStringTokenUnits(value)
+		totalChars += len([]rune(value))
 	}
 
 	if blocks, err := normalizeSystemBlocks(system); err == nil {
@@ -5290,41 +5278,11 @@ func estimateInputTokens(system any, messages []AnthropicMessage, tools []Anthro
 		}
 	}
 
-	if totalUnits == 0 {
+	if totalChars == 0 {
 		return 0
 	}
 
-	return int(math.Ceil(totalUnits))
-}
-
-func estimateStringTokenUnits(value string) float64 {
-	if value == "" {
-		return 0
-	}
-	var asciiLetters int
-	var digits int
-	var whitespace int
-	var punctuation int
-	var nonASCII int
-	for _, r := range value {
-		switch {
-		case unicode.IsSpace(r):
-			whitespace++
-		case r > unicode.MaxASCII:
-			nonASCII++
-		case unicode.IsLetter(r):
-			asciiLetters++
-		case unicode.IsDigit(r):
-			digits++
-		default:
-			punctuation++
-		}
-	}
-	units := float64(asciiLetters+digits)/4.0 + float64(punctuation)/3.0 + float64(whitespace)/8.0 + float64(nonASCII)
-	if units == 0 {
-		return 0
-	}
-	return units
+	return int(math.Ceil(float64(totalChars) / 4.0))
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errorType, message string) {

@@ -3731,6 +3731,25 @@ func TestHandleMessagesStreamMapsIncompleteResponseToMessageStop(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesStreamMapsResponseErrorEventToError(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.error\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.error\",\"error\":{\"message\":\"upstream stream error\"}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "upstream stream error") {
+		t.Fatalf("response.error not mapped to anthropic error\n%s", body)
+	}
+}
+
 func TestHandleMessagesStreamMapsFailedResponseToErrorEvent(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -3761,13 +3780,15 @@ func TestHandleMessagesStreamMapsFailedResponseToErrorEvent(t *testing.T) {
 	}
 }
 
-func TestHandleMessagesStreamRejectsWhitespaceFloodInFunctionCallArguments(t *testing.T) {
+func TestHandleMessagesStreamAllowsWhitespaceOnlyFunctionCallArgumentDeltas(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: response.output_item.added\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"ToolSearch\",\"call_id\":\"toolu_1\"}}\n\n")
 		_, _ = io.WriteString(w, "event: response.function_call_arguments.delta\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"                     \"}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"                     {\\\"query\\\":\\\"ctf\\\"}\"}\n\n")
 		_, _ = io.WriteString(w, "event: response.completed\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n")
 	}))
@@ -3790,8 +3811,11 @@ func TestHandleMessagesStreamRejectsWhitespaceFloodInFunctionCallArguments(t *te
 	proxy.Handler().ServeHTTP(recorder, request)
 
 	body := recorder.Body.String()
-	if !strings.Contains(body, "event: error") || !strings.Contains(body, "excessive whitespace in function_call_arguments.delta") {
-		t.Fatalf("whitespace flood not rejected\n%s", body)
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("whitespace-only argument delta should not be rejected\n%s", body)
+	}
+	if !strings.Contains(body, "event: message_stop") || !strings.Contains(body, "\"type\":\"tool_use\"") {
+		t.Fatalf("whitespace-only argument delta should still translate normally\n%s", body)
 	}
 }
 
@@ -3860,6 +3884,29 @@ func TestHandleMessagesStreamRejectsOversizedToolArguments(t *testing.T) {
 	body := recorder.Body.String()
 	if !strings.Contains(body, "event: error") || !strings.Contains(body, "oversized function_call_arguments") {
 		t.Fatalf("oversized arguments not rejected\n%s", body)
+	}
+}
+
+func TestHandleMessagesStreamRejectsFirstDoneThatConflictsWithAccumulatedDelta(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_item.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"ToolSearch\",\"call_id\":\"toolu_1\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.delta\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"query\\\":\\\"ctf\\\"\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.function_call_arguments.done\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"query\\\":\\\"other\\\"}\"}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "response.function_call_arguments.done does not match accumulated tool arguments") {
+		t.Fatalf("conflicting first done not rejected\n%s", body)
 	}
 }
 
@@ -6346,6 +6393,13 @@ func TestClassifyCapabilityFailureRecognizesProviderStyleVariants(t *testing.T) 
 			want:    "compaction_input",
 		},
 		{
+			name:    "compaction input invalid enum with indexed param",
+			status:  http.StatusBadRequest,
+			body:    `{"error":{"message":"Invalid value for input[0].type: expected one of message, reasoning","type":"invalid_request_error","param":"input[0].type"}}`,
+			payload: OpenAIResponsesRequest{Input: []OpenAIInputItem{{Type: "compaction", ID: "cmp_123", EncryptedContent: "opaque"}}},
+			want:    "compaction_input",
+		},
+		{
 			name:    "compaction input unrecognized type on 422",
 			status:  http.StatusUnprocessableEntity,
 			body:    `{"error":{"message":"Unrecognized input item type: compaction","type":"invalid_request_error","param":"input[0].type"}}`,
@@ -7822,6 +7876,83 @@ func TestHandleMessagesRetriesWithoutPersistedHistoryIDsAfterStatelessSessionErr
 	if len(requests) != 2 {
 		t.Fatalf("backend request count = %d, want 2", len(requests))
 	}
+
+	recorder2 := httptest.NewRecorder()
+	request2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	request2.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder2, request2)
+
+	if recorder2.Code != http.StatusOK {
+		t.Fatalf("second round status = %d, body = %s", recorder2.Code, recorder2.Body.String())
+	}
+	if len(requests) != 3 {
+		t.Fatalf("sticky disable request count = %d, want 3", len(requests))
+	}
+	thirdInput, ok := requests[2]["input"].([]any)
+	if !ok || len(thirdInput) == 0 {
+		t.Fatalf("third request missing input payload: %#v", requests[2])
+	}
+	thirdFirstItem, ok := thirdInput[0].(map[string]any)
+	if !ok {
+		t.Fatalf("third request first input item shape = %#v", thirdInput[0])
+	}
+	if _, ok := thirdFirstItem["id"]; ok {
+		t.Fatalf("third request should keep persisted-history ids disabled after fallback: %#v", thirdFirstItem)
+	}
+}
+
+func TestOptionsForRequestInputItemPersistenceTTLLeaseStaysConfiguredBackendScoped(t *testing.T) {
+	currentTime := time.Date(2026, 4, 17, 1, 30, 0, 0, time.UTC)
+	proxy := New(Config{
+		BackendBaseURL:       "https://example.com/codex",
+		BackendPath:          "/v1/responses",
+		BackendAPIKey:        "test-key",
+		BackendModel:         "gpt-5.4",
+		CapabilityReprobeTTL: 30 * time.Minute,
+	})
+	proxy.now = func() time.Time { return currentTime }
+	scopeA := backendCapabilityScopeKey("gpt-5.4")
+	scopeB := backendCapabilityScopeKey("gpt-5.4-mini")
+	proxy.scopedCaps[scopeA] = scopedRuntimeCapabilities{InputItemPersistence: capabilityUnsupported}
+	proxy.unsupportedUntil[capabilityCooldownKey(scopeA, "input_item_persistence")] = currentTime.Add(-1 * time.Minute)
+
+	carrier := encodeReasoningCarrier(OpenAIOutputItem{
+		ID:               "rs_legacy",
+		Type:             "reasoning",
+		EncryptedContent: "opaque-reasoning",
+		Summary:          []OpenAIReasoningPart{{Type: "summary_text", Text: "brief reasoning"}},
+	})
+	req := AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "assistant", Content: []any{
+				map[string]any{"type": "thinking", "thinking": "brief reasoning", "signature": carrier},
+				map[string]any{"type": "text", "text": "continuing"},
+			}},
+			{Role: "user", Content: "continue"},
+		},
+	}
+
+	optsA1 := proxy.optionsForRequest(req, nil)
+	optsA2 := proxy.optionsForRequest(req, nil)
+	proxy.cfg.BackendModel = "gpt-5.4-mini"
+	optsB := proxy.optionsForRequest(req, nil)
+
+	if optsA1.StripRoundTripItemIDs {
+		t.Fatalf("first request for backend scope A should reprobe persisted-history ids")
+	}
+	if !optsA2.StripRoundTripItemIDs {
+		t.Fatalf("second request for backend scope A should honor reprobe lease and stay downgraded")
+	}
+	if optsB.StripRoundTripItemIDs {
+		t.Fatalf("backend scope B should not inherit persistence downgrade from scope A")
+	}
+	if _, ok := proxy.reprobeUntil[capabilityReprobeLeaseKey(scopeA, "input_item_persistence")]; !ok {
+		t.Fatalf("backend scope A should acquire reprobe lease")
+	}
+	if _, ok := proxy.reprobeUntil[capabilityReprobeLeaseKey(scopeB, "input_item_persistence")]; ok {
+		t.Fatalf("backend scope B should not acquire reprobe lease from scope A")
+	}
 }
 
 func TestHandleMessagesRetriesWithoutPhaseAfterUnsupportedParameterPhase(t *testing.T) {
@@ -9252,5 +9383,85 @@ func TestBuildBackendRequestConvertsImageFileIDAndDocumentTextSource(t *testing.
 	}
 	if content[1].Type != "input_text" || content[1].Text != "hello" {
 		t.Fatalf("document text source mapping incorrect: %#v", content[1])
+	}
+}
+
+func TestHandleMessagesStreamDoesNotTimeOutWhileReadingBackendStream(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(80 * time.Millisecond)
+		_, _ = io.WriteString(w, "event: response.output_item.added\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"hello after delay\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n")
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		RequestTimeout: 20 * time.Millisecond,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"stream":true,
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, body)
+	}
+	if strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("stream response unexpectedly hit request timeout\n%s", body)
+	}
+	if !strings.Contains(body, "hello after delay") {
+		t.Fatalf("stream body missing delayed output\n%s", body)
+	}
+}
+
+func TestHandleMessagesNonStreamStillAppliesBackendRequestTimeout(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(OpenAIResponsesResponse{
+			ID: "resp_timeout",
+		})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL: backend.URL,
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "rawchat-key",
+		RequestTimeout: 20 * time.Millisecond,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d, body = %s", recorder.Code, http.StatusBadGateway, body)
+	}
+	if !strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("non-stream response should still surface backend timeout\n%s", body)
 	}
 }
