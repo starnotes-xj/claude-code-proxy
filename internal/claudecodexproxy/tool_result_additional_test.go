@@ -2,10 +2,17 @@ package claudecodexproxy
 
 import (
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+type flushFunc func()
+
+func (f flushFunc) Flush() { f() }
+
+var _ http.Flusher = flushFunc(nil)
 
 func TestNormalizeToolSchemaAddsEmptyPropertiesForObjectSchemas(t *testing.T) {
 	t.Parallel()
@@ -361,5 +368,247 @@ func TestConvertReasoningOrCompactionInputItemUsesUnifiedCarrierBoundary(t *test
 				t.Fatalf("item = %#v, want type=%q id=%q encrypted=%q", got, tc.wantType, tc.wantID, tc.wantEncrypted)
 			}
 		})
+	}
+}
+
+func TestSanitizeClaudeCodeToolInputRemovesEmptyReadPages(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]any{
+		"file_path": "/tmp/example.txt",
+		"pages":     "",
+	}
+	sanitizeClaudeCodeToolInput("Read", input)
+
+	if _, ok := input["pages"]; ok {
+		t.Fatalf("empty Read pages was not removed: %#v", input)
+	}
+	if got := input["file_path"]; got != "/tmp/example.txt" {
+		t.Fatalf("file_path = %#v, want preserved path", got)
+	}
+}
+
+func TestSanitizeClaudeCodeToolInputPreservesNonEmptyReadPages(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]any{
+		"file_path": "/tmp/example.pdf",
+		"pages":     "1-2",
+	}
+	sanitizeClaudeCodeToolInput("Read", input)
+
+	if got := input["pages"]; got != "1-2" {
+		t.Fatalf("pages = %#v, want preserved range", got)
+	}
+}
+
+func TestSanitizeClaudeCodeToolInputOnlyAppliesToReadAndWrite(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]any{"pages": ""}
+	sanitizeClaudeCodeToolInput("OtherTool", input)
+
+	if got, ok := input["pages"]; !ok || got != "" {
+		t.Fatalf("non-Read/Write pages changed: %#v", input)
+	}
+}
+
+func TestSanitizeClaudeCodeToolInputRemovesEmptyWritePages(t *testing.T) {
+	t.Parallel()
+
+	input := map[string]any{
+		"file_path": "/tmp/example.txt",
+		"content":   "hello",
+		"pages":     "",
+	}
+	sanitizeClaudeCodeToolInput("Write", input)
+
+	if _, ok := input["pages"]; ok {
+		t.Fatalf("empty Write pages was not removed: %#v", input)
+	}
+	if got := input["file_path"]; got != "/tmp/example.txt" {
+		t.Fatalf("file_path = %#v, want preserved path", got)
+	}
+}
+
+func TestSanitizeClaudeCodeToolArgumentsRemovesEmptyWritePages(t *testing.T) {
+	t.Parallel()
+
+	got := sanitizeClaudeCodeToolArguments("Write", `{"file_path":"/tmp/example.txt","content":"hello","pages":""}`)
+	var input map[string]any
+	if err := json.Unmarshal([]byte(got), &input); err != nil {
+		t.Fatalf("sanitized arguments are not JSON: %v", err)
+	}
+	if _, ok := input["pages"]; ok {
+		t.Fatalf("empty Write pages was not removed from arguments: %#v", input)
+	}
+	if got := input["file_path"]; got != "/tmp/example.txt" {
+		t.Fatalf("file_path = %#v, want preserved path", got)
+	}
+}
+
+func TestSSETranslatorBuffersWriteDeltasAndRemovesEmptyPages(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"id":"fc_write","type":"function_call","name":"Write","call_id":"toolu_write"}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_write","delta":"{\"file_path\":\"/tmp/example.txt\",\"content\":\"hello\",\"pages\":\"\"}"}`,
+		"",
+		"event: response.function_call_arguments.done",
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_write"}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_write","output":[{"id":"fc_write","type":"function_call","call_id":"toolu_write","name":"Write","arguments":"{\"file_path\":\"/tmp/example.txt\",\"content\":\"hello\",\"pages\":\"\"}"}],"usage":{"input_tokens":7,"output_tokens":3}}}`,
+		"",
+	}, "\n")
+
+	var out strings.Builder
+	translator := newSSETranslator(&out, flushFunc(func() {}), "claude-sonnet-4-5", "msg_write", nil)
+	if err := translator.consume(strings.NewReader(stream)); err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+
+	body := out.String()
+	if strings.Contains(body, `\"pages\":\"\"`) || strings.Contains(body, `"pages":""`) {
+		t.Fatalf("stream leaked empty Write pages:\n%s", body)
+	}
+	if !strings.Contains(body, `\"file_path\":\"/tmp/example.txt\"`) && !strings.Contains(body, `"file_path":"/tmp/example.txt"`) {
+		t.Fatalf("stream missing sanitized Write file_path:\n%s", body)
+	}
+}
+
+func TestSanitizeClaudeCodeToolArgumentsRemovesEmptyReadPages(t *testing.T) {
+	t.Parallel()
+
+	got := sanitizeClaudeCodeToolArguments("Read", `{"file_path":"/tmp/example.txt","pages":""}`)
+	var input map[string]any
+	if err := json.Unmarshal([]byte(got), &input); err != nil {
+		t.Fatalf("sanitized arguments are not JSON: %v", err)
+	}
+	if _, ok := input["pages"]; ok {
+		t.Fatalf("empty Read pages was not removed from arguments: %#v", input)
+	}
+	if got := input["file_path"]; got != "/tmp/example.txt" {
+		t.Fatalf("file_path = %#v, want preserved path", got)
+	}
+}
+
+func TestSSETranslatorBuffersReadDeltasAndRemovesEmptyPages(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"id":"fc_read","type":"function_call","name":"Read","call_id":"toolu_read"}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_read","delta":"{\"file_path\":\"/tmp/example.txt\",\"pages\":\"\"}"}`,
+		"",
+		"event: response.function_call_arguments.done",
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_read"}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_read","output":[{"id":"fc_read","type":"function_call","call_id":"toolu_read","name":"Read","arguments":"{\"file_path\":\"/tmp/example.txt\",\"pages\":\"\"}"}],"usage":{"input_tokens":7,"output_tokens":3}}}`,
+		"",
+	}, "\n")
+
+	var out strings.Builder
+	translator := newSSETranslator(&out, flushFunc(func() {}), "claude-sonnet-4-5", "msg_read", nil)
+	if err := translator.consume(strings.NewReader(stream)); err != nil {
+		t.Fatalf("consume stream: %v", err)
+	}
+
+	body := out.String()
+	if strings.Contains(body, `\"pages\":\"\"`) || strings.Contains(body, `"pages":""`) {
+		t.Fatalf("stream leaked empty Read pages:\n%s", body)
+	}
+	if !strings.Contains(body, `\"file_path\":\"/tmp/example.txt\"`) && !strings.Contains(body, `"file_path":"/tmp/example.txt"`) {
+		t.Fatalf("stream missing sanitized Read file_path:\n%s", body)
+	}
+}
+
+func TestConvertToolUseInputItemRemovesEmptyReadPages(t *testing.T) {
+	t.Parallel()
+
+	item := convertToolUseInputItem(AnthropicContentBlock{
+		Type:  "tool_use",
+		Name:  "Read",
+		ID:    "toolu_read_1",
+		Input: json.RawMessage(`{"file_path":"/tmp/example.txt","pages":""}`),
+	})
+
+	if item.Type != "function_call" || item.Name != "Read" {
+		t.Fatalf("item = %#v, want Read function_call", item)
+	}
+	if strings.Contains(item.Arguments, `"pages"`) {
+		t.Fatalf("empty Read pages was not removed from input arguments: %s", item.Arguments)
+	}
+	if !strings.Contains(item.Arguments, `"file_path"`) {
+		t.Fatalf("file_path missing from arguments: %s", item.Arguments)
+	}
+}
+
+func TestConvertToolUseInputItemPreservesNonEmptyReadPages(t *testing.T) {
+	t.Parallel()
+
+	item := convertToolUseInputItem(AnthropicContentBlock{
+		Type:  "tool_use",
+		Name:  "Read",
+		ID:    "toolu_read_2",
+		Input: json.RawMessage(`{"file_path":"/tmp/example.pdf","pages":"1-2"}`),
+	})
+
+	if !strings.Contains(item.Arguments, `"pages":"1-2"`) {
+		t.Fatalf("non-empty Read pages was removed: %s", item.Arguments)
+	}
+}
+
+func TestConvertToolUseInputItemOnlySanitizesReadAndWrite(t *testing.T) {
+	t.Parallel()
+
+	item := convertToolUseInputItem(AnthropicContentBlock{
+		Type:  "tool_use",
+		Name:  "Bash",
+		ID:    "toolu_bash_1",
+		Input: json.RawMessage(`{"command":"ls","pages":""}`),
+	})
+
+	if !strings.Contains(item.Arguments, `"pages":""`) {
+		t.Fatalf("non-Read/Write tool pages was incorrectly removed: %s", item.Arguments)
+	}
+}
+
+func TestConvertToolUseInputItemRemovesEmptyWritePages(t *testing.T) {
+	t.Parallel()
+
+	item := convertToolUseInputItem(AnthropicContentBlock{
+		Type:  "tool_use",
+		Name:  "Write",
+		ID:    "toolu_write_1",
+		Input: json.RawMessage(`{"file_path":"/tmp/example.txt","content":"hello","pages":""}`),
+	})
+
+	if strings.Contains(item.Arguments, `"pages"`) {
+		t.Fatalf("empty Write pages was not removed from input arguments: %s", item.Arguments)
+	}
+	if !strings.Contains(item.Arguments, `"file_path"`) {
+		t.Fatalf("file_path missing from arguments: %s", item.Arguments)
+	}
+}
+
+func TestConvertToolUseInputItemHandlesEmptyInput(t *testing.T) {
+	t.Parallel()
+
+	item := convertToolUseInputItem(AnthropicContentBlock{
+		Type:  "tool_use",
+		Name:  "Read",
+		ID:    "toolu_read_3",
+		Input: nil,
+	})
+
+	if item.Arguments != "{}" {
+		t.Fatalf("empty input should become {}, got: %s", item.Arguments)
 	}
 }

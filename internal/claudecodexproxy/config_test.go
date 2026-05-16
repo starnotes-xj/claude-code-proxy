@@ -182,6 +182,9 @@ func TestLoadConfigFromEnvParsesOptionalFlags(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_CONTINUITY_METADATA", "true")
 	t.Setenv("CLAUDE_CODE_PROXY_DISABLE_PROMPT_CACHE_KEY", "true")
 	t.Setenv("CLAUDE_CODE_PROXY_ANONYMOUS_MODE", "true")
+	t.Setenv("CLAUDE_CODE_PROXY_MAX_INBOUND_BODY_BYTES", "12345")
+	t.Setenv("CLAUDE_CODE_PROXY_MAX_BACKEND_REQUEST_BYTES", "23456")
+	t.Setenv("CLAUDE_CODE_PROXY_MAX_BACKEND_ERROR_BODY_BYTES", "34567")
 
 	cfg, err := LoadConfigFromEnv()
 	if err != nil {
@@ -226,6 +229,15 @@ func TestLoadConfigFromEnvParsesOptionalFlags(t *testing.T) {
 	}
 	if !cfg.AnonymousMode {
 		t.Fatalf("AnonymousMode = false, want true")
+	}
+	if cfg.MaxInboundBodyBytes != 12345 {
+		t.Fatalf("MaxInboundBodyBytes = %d, want 12345", cfg.MaxInboundBodyBytes)
+	}
+	if cfg.MaxBackendRequestBytes != 23456 {
+		t.Fatalf("MaxBackendRequestBytes = %d, want 23456", cfg.MaxBackendRequestBytes)
+	}
+	if cfg.MaxBackendErrorBodyBytes != 34567 {
+		t.Fatalf("MaxBackendErrorBodyBytes = %d, want 34567", cfg.MaxBackendErrorBodyBytes)
 	}
 }
 
@@ -495,6 +507,40 @@ func TestLoadConfigFromEnvRejectsInvalidAnonymousMode(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "CLAUDE_CODE_PROXY_ANONYMOUS_MODE") {
 		t.Fatalf("error = %q, want anonymous mode env name", err)
+	}
+}
+
+func TestLoadConfigFromEnvRejectsInvalidMaxBodyBytes(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{name: "inbound non numeric", env: "CLAUDE_CODE_PROXY_MAX_INBOUND_BODY_BYTES", value: "maybe"},
+		{name: "backend request negative", env: "CLAUDE_CODE_PROXY_MAX_BACKEND_REQUEST_BYTES", value: "-1"},
+		{name: "backend error non numeric", env: "CLAUDE_CODE_PROXY_MAX_BACKEND_ERROR_BODY_BYTES", value: "maybe"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			codexHome := filepath.Join(home, ".codex")
+			writeTestFile(t, filepath.Join(codexHome, "auth.json"), `{"OPENAI_API_KEY":"from-codex-auth"}`)
+
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("CODEX_HOME", codexHome)
+			setRequiredBackendBaseEnv(t)
+			t.Setenv(tc.env, tc.value)
+
+			_, err := LoadConfigFromEnv()
+			if err == nil {
+				t.Fatalf("LoadConfigFromEnv() error = nil, want invalid env error")
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Fatalf("error = %q, want %s", err, tc.env)
+			}
+		})
 	}
 }
 

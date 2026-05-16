@@ -598,6 +598,153 @@ func TestHandleMessagesDoesNotSendPromptCacheKeyWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesRejectsInboundBodyTooLarge(t *testing.T) {
+	backendHits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL:      backend.URL,
+		BackendPath:         "/v1/responses",
+		BackendAPIKey:       "rawchat-key",
+		MaxInboundBodyBytes: 32,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"this request is too large"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", backendHits)
+	}
+	assertAnthropicError(t, recorder.Body.String(), "invalid_request_error", "request body too large")
+}
+
+func TestHandleMessagesRejectsConvertedBackendRequestTooLarge(t *testing.T) {
+	backendHits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL:         backend.URL,
+		BackendPath:            "/v1/responses",
+		BackendAPIKey:          "rawchat-key",
+		MaxBackendRequestBytes: 200,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"`+strings.Repeat("x", 500)+`"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", backendHits)
+	}
+	assertAnthropicError(t, recorder.Body.String(), "invalid_request_error", "CLAUDE_CODE_PROXY_MAX_BACKEND_REQUEST_BYTES")
+}
+
+func TestHandleMessagesRejectsStreamConvertedBackendRequestTooLarge(t *testing.T) {
+	backendHits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL:         backend.URL,
+		BackendPath:            "/v1/responses",
+		BackendAPIKey:          "rawchat-key",
+		MaxBackendRequestBytes: 200,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4-5",
+		"stream":true,
+		"messages":[{"role":"user","content":"`+strings.Repeat("x", 500)+`"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("content-type = %q, want application/json", got)
+	}
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", backendHits)
+	}
+	assertAnthropicError(t, recorder.Body.String(), "invalid_request_error", "request too large after conversion")
+}
+
+func TestHandleMessagesForwardsSmallBackend502(t *testing.T) {
+	backendHits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"type":"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-502/","title":"Error 502: Bad gateway"}`))
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{
+		BackendBaseURL:         backend.URL,
+		BackendPath:            "/v1/responses",
+		BackendAPIKey:          "rawchat-key",
+		MaxBackendRequestBytes: 10000,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := newBasicMessagesRequest()
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if backendHits != 1 {
+		t.Fatalf("backend hits = %d, want 1", backendHits)
+	}
+	assertAnthropicError(t, recorder.Body.String(), "api_error", "Error 502")
+}
+
+func assertAnthropicError(t *testing.T, body, wantType, wantMessageSubstring string) {
+	t.Helper()
+	var envelope AnthropicErrorEnvelope
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode error envelope: %v; body = %s", err, body)
+	}
+	if envelope.Type != "error" {
+		t.Fatalf("envelope type = %q, want error", envelope.Type)
+	}
+	if envelope.Error.Type != wantType {
+		t.Fatalf("error type = %q, want %q; body = %s", envelope.Error.Type, wantType, body)
+	}
+	if !strings.Contains(envelope.Error.Message, wantMessageSubstring) {
+		t.Fatalf("error message = %q, want substring %q", envelope.Error.Message, wantMessageSubstring)
+	}
+}
+
 func TestHandlerRejectsMessagesWithoutClientAuth(t *testing.T) {
 	proxy, backendHits, cleanup := newClientAuthProxyForTest(t, "client-key")
 	defer cleanup()

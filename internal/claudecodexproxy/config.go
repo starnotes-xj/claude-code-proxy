@@ -15,12 +15,15 @@ import (
 )
 
 const (
-	defaultListenAddr            = "127.0.0.1:8787"
-	defaultBackendPath           = "/v1/responses"
-	defaultRequestTimeout        = 120 * time.Second
-	defaultCapabilityReprobeTTL  = 30 * time.Minute
-	defaultAnthropicBase         = "https://api.anthropic.com"
-	defaultClaudeTokenMultiplier = 1.15
+	defaultListenAddr               = "127.0.0.1:8787"
+	defaultBackendPath              = "/v1/responses"
+	defaultRequestTimeout           = 120 * time.Second
+	defaultCapabilityReprobeTTL     = 30 * time.Minute
+	defaultAnthropicBase            = "https://api.anthropic.com"
+	defaultClaudeTokenMultiplier    = 1.15
+	defaultMaxInboundBodyBytes      = 8 * 1024 * 1024
+	defaultMaxBackendRequestBytes   = 5 * 1024 * 1024
+	defaultMaxBackendErrorBodyBytes = 64 * 1024
 )
 
 type Config struct {
@@ -48,6 +51,9 @@ type Config struct {
 	EnableModelCapabilityInit     bool
 	EnablePhaseCommentary         bool
 	DisableStreamingBackend       bool
+	MaxInboundBodyBytes           int64
+	MaxBackendRequestBytes        int64
+	MaxBackendErrorBodyBytes      int64
 	Debug                         bool
 }
 
@@ -67,8 +73,11 @@ func LoadConfigFromEnv() (Config, error) {
 			os.Getenv("CLAUDE_CODE_PROXY_ANTHROPIC_API_KEY"),
 			os.Getenv("ANTHROPIC_API_KEY"),
 		)),
-		ClaudeTokenMultiplier: defaultClaudeTokenMultiplier,
-		CapabilityReprobeTTL:  defaultCapabilityReprobeTTL,
+		ClaudeTokenMultiplier:    defaultClaudeTokenMultiplier,
+		CapabilityReprobeTTL:     defaultCapabilityReprobeTTL,
+		MaxInboundBodyBytes:      defaultMaxInboundBodyBytes,
+		MaxBackendRequestBytes:   defaultMaxBackendRequestBytes,
+		MaxBackendErrorBodyBytes: defaultMaxBackendErrorBodyBytes,
 	}
 
 	if cfg.BackendBaseURL == "" {
@@ -165,6 +174,30 @@ func LoadConfigFromEnv() (Config, error) {
 		cfg.DisableStreamingBackend = parsed
 	}
 
+	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_MAX_INBOUND_BODY_BYTES")); raw != "" {
+		parsed, err := parseNonNegativeInt64Env("CLAUDE_CODE_PROXY_MAX_INBOUND_BODY_BYTES", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.MaxInboundBodyBytes = parsed
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_MAX_BACKEND_REQUEST_BYTES")); raw != "" {
+		parsed, err := parseNonNegativeInt64Env("CLAUDE_CODE_PROXY_MAX_BACKEND_REQUEST_BYTES", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.MaxBackendRequestBytes = parsed
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_MAX_BACKEND_ERROR_BODY_BYTES")); raw != "" {
+		parsed, err := parseNonNegativeInt64Env("CLAUDE_CODE_PROXY_MAX_BACKEND_ERROR_BODY_BYTES", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.MaxBackendErrorBodyBytes = parsed
+	}
+
 	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_DEBUG")); raw != "" {
 		parsed, err := strconv.ParseBool(raw)
 		if err != nil {
@@ -233,6 +266,38 @@ func (c Config) EffectiveForwardUserMetadata() bool {
 		return *c.ForwardUserMetadata
 	}
 	return !c.DisableUserMetadataForwarding
+}
+
+func (c Config) EffectiveMaxInboundBodyBytes() int64 {
+	if c.MaxInboundBodyBytes > 0 {
+		return c.MaxInboundBodyBytes
+	}
+	return defaultMaxInboundBodyBytes
+}
+
+func (c Config) EffectiveMaxBackendRequestBytes() int64 {
+	if c.MaxBackendRequestBytes > 0 {
+		return c.MaxBackendRequestBytes
+	}
+	return defaultMaxBackendRequestBytes
+}
+
+func (c Config) EffectiveMaxBackendErrorBodyBytes() int64 {
+	if c.MaxBackendErrorBodyBytes > 0 {
+		return c.MaxBackendErrorBodyBytes
+	}
+	return defaultMaxBackendErrorBodyBytes
+}
+
+func parseNonNegativeInt64Env(name, raw string) (int64, error) {
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("invalid %s: must be non-negative", name)
+	}
+	return parsed, nil
 }
 
 func parseCSVEnvAllowlist(raw string) []string {

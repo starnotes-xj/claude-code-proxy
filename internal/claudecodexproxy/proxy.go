@@ -1378,8 +1378,22 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	maxBodyBytes := p.cfg.EffectiveMaxInboundBodyBytes()
+	p.debugf("incoming request content_length=%d max_inbound_body_bytes=%d", r.ContentLength, maxBodyBytes)
+	if r.ContentLength > maxBodyBytes {
+		p.warnf("rejecting inbound request: content_length=%d max_inbound_body_bytes=%d", r.ContentLength, maxBodyBytes)
+		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", fmt.Sprintf("request body too large: inbound Anthropic request is %d bytes, limit is %d bytes", r.ContentLength, maxBodyBytes))
+		return
+	}
+
 	var req AnthropicMessagesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			p.warnf("rejecting inbound request: exceeded max_inbound_body_bytes=%d", maxBodyBytes)
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", fmt.Sprintf("request body too large: inbound Anthropic request exceeds %d bytes", maxBodyBytes))
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body")
 		return
 	}
@@ -1399,7 +1413,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) handleNonStream(w http.ResponseWriter, ctx context.Context, anthropicReq AnthropicMessagesRequest, headers http.Header) {
 	resp, payload, err := p.doBackendWithAdaptiveRetry(ctx, anthropicReq, headers)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+		p.writeProxyError(w, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -1447,7 +1461,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, ctx context.Context, anthrop
 
 	resp, payload, err := p.doBackendWithAdaptiveRetry(ctx, anthropicReq, headers)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+		p.writeProxyError(w, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -1569,6 +1583,14 @@ func (p *Proxy) buildBackendRequestWithOptions(ctx context.Context, anthropicReq
 	if err != nil {
 		return OpenAIResponsesRequest{}, nil, fmt.Errorf("marshal backend request: %w", err)
 	}
+	backendRequestBytes := int64(len(body))
+	maxBackendRequestBytes := p.cfg.EffectiveMaxBackendRequestBytes()
+	p.debugf("backend request size bytes=%d max_backend_request_bytes=%d model=%q stream=%t input_items=%d tools=%d", backendRequestBytes, maxBackendRequestBytes, backendReq.Model, backendReq.Stream, len(backendReq.Input), len(backendReq.Tools))
+	if backendRequestBytes > maxBackendRequestBytes {
+		err := requestTooLargeError{Stage: "backend_request", Size: backendRequestBytes, Limit: maxBackendRequestBytes}
+		p.warnf("rejecting backend request: bytes=%d limit=%d model=%q stream=%t input_items=%d tools=%d", backendRequestBytes, maxBackendRequestBytes, backendReq.Model, backendReq.Stream, len(backendReq.Input), len(backendReq.Tools))
+		return OpenAIResponsesRequest{}, nil, err
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.BackendURL(), bytes.NewReader(body))
 	if err != nil {
@@ -1593,16 +1615,20 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 			return nil, OpenAIResponsesRequest{}, err
 		}
 
+		started := time.Now()
 		resp, err := p.backendHTTPClientFor(payload).Do(req)
+		duration := time.Since(started)
 		if err != nil {
+			p.debugf("backend request failed duration=%s request_bytes=%d stream=%t model=%q error=%s", duration, req.ContentLength, payload.Stream, payload.Model, err.Error())
 			return nil, payload, err
 		}
+		p.debugf("backend response status=%d duration=%s request_bytes=%d stream=%t model=%q server=%q cf_ray=%q content_type=%q", resp.StatusCode, duration, req.ContentLength, payload.Stream, payload.Model, resp.Header.Get("Server"), resp.Header.Get("CF-Ray"), resp.Header.Get("Content-Type"))
 		if resp.StatusCode < 400 {
 			p.learnCapabilitiesFromRequest(opts, payload)
 			return resp, payload, nil
 		}
 
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := readLimitedBody(resp.Body, p.cfg.EffectiveMaxBackendErrorBodyBytes())
 		resp.Body.Close()
 		if readErr != nil {
 			return nil, payload, readErr
@@ -2812,6 +2838,7 @@ func convertToolUseInputItem(block AnthropicContentBlock) OpenAIInputItem {
 	if arguments == "" {
 		arguments = "{}"
 	}
+	arguments = sanitizeClaudeCodeToolArguments(block.Name, arguments)
 	callID := block.ID
 	if callID == "" {
 		callID = "call_missing_id"
@@ -3721,6 +3748,39 @@ func schemaTypeIncludesObject(raw any) bool {
 	return false
 }
 
+func needsPagesSanitization(name string) bool {
+	return name == "Read" || name == "Write"
+}
+
+func sanitizeClaudeCodeToolInput(name string, input map[string]any) {
+	if !needsPagesSanitization(name) {
+		return
+	}
+	if pages, ok := input["pages"].(string); ok && strings.TrimSpace(pages) == "" {
+		delete(input, "pages")
+	}
+}
+
+func sanitizeClaudeCodeToolArguments(name, arguments string) string {
+	if !needsPagesSanitization(name) || strings.TrimSpace(arguments) == "" {
+		return arguments
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+		return arguments
+	}
+	before := len(input)
+	sanitizeClaudeCodeToolInput(name, input)
+	if len(input) == before {
+		return arguments
+	}
+	blob, err := json.Marshal(input)
+	if err != nil {
+		return arguments
+	}
+	return string(blob)
+}
+
 func convertToolChoice(choice *AnthropicToolChoice) any {
 	if choice == nil {
 		return nil
@@ -3872,6 +3932,7 @@ func translateBackendResponse(resp OpenAIResponsesResponse, advertisedModel stri
 					return AnthropicMessageResponse{}, fmt.Errorf("decode function call arguments: %w", err)
 				}
 			}
+			sanitizeClaudeCodeToolInput(item.Name, input)
 			callID := item.CallID
 			if callID == "" {
 				callID = item.ID
@@ -4157,17 +4218,21 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 					break
 				}
 				index := t.startToolBlock(event.Item.ID, fallback(event.Item.CallID, event.Item.ID), event.Item.Name)
-				if strings.TrimSpace(event.Item.Arguments) != "" {
-					if err := t.validateToolArgumentsPayload(event.Item.ID, event.Item.Arguments); err != nil {
+				arguments := sanitizeClaudeCodeToolArguments(event.Item.Name, event.Item.Arguments)
+				if strings.TrimSpace(arguments) != "" {
+					if err := t.validateToolArgumentsPayload(event.Item.ID, arguments); err != nil {
 						return err
 					}
-					t.toolArguments[event.Item.ID] = event.Item.Arguments
+					if t.shouldBufferToolArguments(event.Item.ID) {
+						t.toolArguments[event.Item.ID] = ""
+					}
+					t.toolArguments[event.Item.ID] = arguments
 					t.writeEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
 						"index": index,
 						"delta": map[string]any{
 							"type":         "input_json_delta",
-							"partial_json": event.Item.Arguments,
+							"partial_json": arguments,
 						},
 					})
 				}
@@ -4192,6 +4257,9 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 			return err
 		}
 		t.toolArguments[event.ItemID] += event.Delta
+		if t.shouldBufferToolArguments(event.ItemID) {
+			break
+		}
 		t.writeEvent("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
 			"index": index,
@@ -4202,7 +4270,7 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 		})
 	case "response.function_call_arguments.done":
 		if t.closedToolBlocks[event.ItemID] {
-			current := strings.TrimSpace(t.toolArguments[event.ItemID])
+			current := strings.TrimSpace(sanitizeClaudeCodeToolArguments(t.toolNames[event.ItemID], t.toolArguments[event.ItemID]))
 			incoming := strings.TrimSpace(fallback(event.Delta, event.Arguments))
 			if incoming == "" || incoming == current {
 				return nil
@@ -4212,8 +4280,16 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 		callID := fallback(event.ItemID, "tool_missing")
 		index := t.startToolBlock(event.ItemID, callID, t.toolNames[event.ItemID])
 		argumentsDelta := fallback(event.Delta, event.Arguments)
+		if t.shouldBufferToolArguments(event.ItemID) {
+			argumentsDelta = sanitizeClaudeCodeToolArguments(t.toolNames[event.ItemID], fallback(argumentsDelta, t.toolArguments[event.ItemID]))
+		} else {
+			argumentsDelta = sanitizeClaudeCodeToolArguments(t.toolNames[event.ItemID], argumentsDelta)
+		}
 		if err := t.validateToolArgumentsPayload(event.ItemID, argumentsDelta); err != nil {
 			return err
+		}
+		if t.shouldBufferToolArguments(event.ItemID) {
+			t.toolArguments[event.ItemID] = ""
 		}
 		t.debugfTool("stream tool arguments item_id=%q call_id=%q name=%q arguments=%s", event.ItemID, callID, t.toolNames[event.ItemID], sanitizeLogValue(argumentsDelta))
 		remainder, err := t.remainingToolArguments(event.ItemID, argumentsDelta, "response.function_call_arguments.done")
@@ -4315,10 +4391,14 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 				}
 				callID := fallback(event.Item.CallID, fallback(event.Item.ID, "tool_missing"))
 				index := t.startToolBlock(event.Item.ID, callID, event.Item.Name)
-				if err := t.validateToolArgumentsPayload(event.Item.ID, event.Item.Arguments); err != nil {
+				arguments := sanitizeClaudeCodeToolArguments(event.Item.Name, event.Item.Arguments)
+				if t.shouldBufferToolArguments(event.Item.ID) {
+					arguments = sanitizeClaudeCodeToolArguments(event.Item.Name, fallback(arguments, t.toolArguments[event.Item.ID]))
+				}
+				if err := t.validateToolArgumentsPayload(event.Item.ID, arguments); err != nil {
 					return err
 				}
-				remainder, err := t.remainingToolArguments(event.Item.ID, event.Item.Arguments, "response.output_item.done")
+				remainder, err := t.remainingToolArguments(event.Item.ID, arguments, "response.output_item.done")
 				if err != nil {
 					return err
 				}
@@ -4533,8 +4613,9 @@ func remainingSnapshotSuffix(current, full string) string {
 }
 
 func (t *sseTranslator) acceptLateClosedToolArguments(itemID, incoming, source string) error {
+	incoming = sanitizeClaudeCodeToolArguments(t.toolNames[itemID], incoming)
 	incoming = strings.TrimSpace(incoming)
-	current := strings.TrimSpace(t.toolArguments[itemID])
+	current := strings.TrimSpace(sanitizeClaudeCodeToolArguments(t.toolNames[itemID], t.toolArguments[itemID]))
 	if incoming == "" || incoming == current {
 		return nil
 	}
@@ -4875,6 +4956,10 @@ func (t *sseTranslator) debugfTool(format string, args ...any) {
 	t.debugf(format, args...)
 }
 
+func (t *sseTranslator) shouldBufferToolArguments(itemID string) bool {
+	return needsPagesSanitization(t.toolNames[itemID])
+}
+
 func (t *sseTranslator) remainingToolArguments(itemID, full, source string) (string, error) {
 	if strings.TrimSpace(full) == "" {
 		return "", nil
@@ -5203,12 +5288,12 @@ func setOutputTextContent(content []OpenAIOutputContent, index int, text string,
 }
 
 func (p *Proxy) forwardBackendError(w http.ResponseWriter, resp *http.Response) {
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimitedBody(resp.Body, p.cfg.EffectiveMaxBackendErrorBodyBytes())
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "backend error")
 		return
 	}
-	p.debugf("backend error status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	p.debugf("backend error status=%d body=%s", resp.StatusCode, sanitizeLogValue(string(body)))
 
 	var backendErr OpenAIResponsesResponse
 	if err := json.Unmarshal(body, &backendErr); err == nil && backendErr.Error != nil {
@@ -5223,6 +5308,45 @@ func (p *Proxy) forwardBackendError(w http.ResponseWriter, resp *http.Response) 
 	}
 
 	writeAnthropicError(w, resp.StatusCode, "api_error", strings.TrimSpace(string(body)))
+}
+
+type requestTooLargeError struct {
+	Stage string
+	Size  int64
+	Limit int64
+}
+
+func (e requestTooLargeError) Error() string {
+	switch e.Stage {
+	case "backend_request":
+		return fmt.Sprintf("request too large after conversion: backend request is %d bytes, limit is %d bytes. Please compact or clear the conversation, reduce tool output history, or raise CLAUDE_CODE_PROXY_MAX_BACKEND_REQUEST_BYTES if your upstream supports larger bodies.", e.Size, e.Limit)
+	default:
+		return fmt.Sprintf("request body too large: %s is %d bytes, limit is %d bytes", e.Stage, e.Size, e.Limit)
+	}
+}
+
+func (p *Proxy) writeProxyError(w http.ResponseWriter, err error) {
+	var tooLarge requestTooLargeError
+	if errors.As(err, &tooLarge) {
+		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", tooLarge.Error())
+		return
+	}
+	writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+}
+
+func readLimitedBody(body io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = defaultMaxBackendErrorBodyBytes
+	}
+	limited := io.LimitReader(body, limit+1)
+	blob, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(blob)) > limit {
+		return append(blob[:limit], []byte("...(truncated)")...), nil
+	}
+	return blob, nil
 }
 
 func estimateInputTokens(system any, messages []AnthropicMessage, tools []AnthropicTool) int {
@@ -5325,6 +5449,10 @@ func (p *Proxy) debugf(format string, args ...any) {
 	if !p.cfg.Debug {
 		return
 	}
+	log.Printf("[claude-codex-proxy] "+format, args...)
+}
+
+func (p *Proxy) warnf(format string, args ...any) {
 	log.Printf("[claude-codex-proxy] "+format, args...)
 }
 
