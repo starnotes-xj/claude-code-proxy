@@ -260,6 +260,44 @@ func TestAggregateBackendStreamMergesInterleavedOutputEvents(t *testing.T) {
 	}
 }
 
+func mustJSONForTest(t *testing.T, value string) string {
+	t.Helper()
+	blob, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal test value: %v", err)
+	}
+	return string(blob)
+}
+
+func TestAggregateBackendStreamMergesSnapshotStyleFunctionArguments(t *testing.T) {
+	t.Parallel()
+
+	first := `{"query":"abc"`
+	full := first + `,"limit":10}`
+	stream := strings.Join([]string{
+		"event: response.output_item.added",
+		`data: {"item":{"id":"tool_1","type":"function_call","call_id":"call_1","name":"ToolSearch"}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"item_id":"tool_1","delta":` + mustJSONForTest(t, first) + `}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"item_id":"tool_1","delta":` + mustJSONForTest(t, full) + `}`,
+		"",
+		"event: response.function_call_arguments.done",
+		`data: {"item_id":"tool_1","arguments":` + mustJSONForTest(t, full) + `}`,
+		"",
+	}, "\n")
+
+	got, err := aggregateBackendStream(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("aggregateBackendStream error = %v", err)
+	}
+	if len(got.Output) != 1 || got.Output[0].Arguments != full {
+		t.Fatalf("snapshot-style arguments not merged once: %#v", got.Output)
+	}
+}
+
 func TestAggregateBackendStreamReturnsBackendErrors(t *testing.T) {
 	t.Parallel()
 

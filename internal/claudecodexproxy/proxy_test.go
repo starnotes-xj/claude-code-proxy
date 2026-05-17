@@ -148,6 +148,53 @@ func TestBuildBackendRequestConvertsToolHistory(t *testing.T) {
 	}
 }
 
+func TestBuildBackendRequestStripsToolsForCompactRequest(t *testing.T) {
+	proxy := New(Config{
+		BackendBaseURL:            "https://example.com/codex",
+		BackendPath:               "/v1/responses",
+		BackendAPIKey:             "test-key",
+		BackendModel:              "gpt-5.4",
+		EnableModelCapabilityInit: true,
+	})
+	proxy.seedCapabilitiesFromModels([]map[string]any{
+		normalizeModelDescriptor(map[string]any{
+			"id": "gpt-5.4",
+			"capabilities": map[string]any{"supports": map[string]any{
+				"tool_calls":          true,
+				"parallel_tool_calls": true,
+			}},
+			"supported_endpoints": []string{"/v1/responses"},
+		}),
+	})
+
+	req, err := proxy.buildBackendRequest(context.Background(), AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: "previous"},
+			{Role: "user", Content: compactTextOnlyGuard + "\n" + compactSummaryPromptStart + "\nPending Tasks:"},
+		},
+		Tools:      []AnthropicTool{{Name: "Read", InputSchema: map[string]any{"type": "object"}}},
+		ToolChoice: &AnthropicToolChoice{Type: "auto"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+	if len(payload.Tools) != 0 {
+		t.Fatalf("compact request should not forward tools: %#v", payload.Tools)
+	}
+	if payload.ToolChoice != "none" {
+		t.Fatalf("compact request tool_choice = %#v, want none", payload.ToolChoice)
+	}
+	if payload.ParallelToolCalls != nil {
+		t.Fatalf("compact request should not enable parallel tool calls: %#v", payload.ParallelToolCalls)
+	}
+}
+
 func TestBuildBackendRequestDerivesPromptCacheKeyFromJSONUserID(t *testing.T) {
 	cfg := Config{
 		BackendBaseURL: "https://example.com/codex",
@@ -698,7 +745,7 @@ func TestHandleMessagesRejectsStreamConvertedBackendRequestTooLarge(t *testing.T
 	assertAnthropicError(t, recorder.Body.String(), "invalid_request_error", "request too large after conversion")
 }
 
-func TestHandleMessagesForwardsSmallBackend502(t *testing.T) {
+func TestHandleMessagesForwardsSmallBackend502AfterRetriesExhaust(t *testing.T) {
 	backendHits := 0
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendHits++
@@ -722,10 +769,44 @@ func TestHandleMessagesForwardsSmallBackend502(t *testing.T) {
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if backendHits != 1 {
-		t.Fatalf("backend hits = %d, want 1", backendHits)
+	if backendHits != maxTransientBackendRetries+1 {
+		t.Fatalf("backend hits = %d, want %d", backendHits, maxTransientBackendRetries+1)
 	}
 	assertAnthropicError(t, recorder.Body.String(), "api_error", "Error 502")
+}
+
+func TestHandleMessagesRetriesTransientBackend502(t *testing.T) {
+	backendHits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		if backendHits == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"cloudflare_error":true,"retryable":true,"title":"Error 502: Bad gateway"}`))
+			return
+		}
+		writeJSONWithStatus(w, http.StatusOK, OpenAIResponsesResponse{
+			ID:     "resp_retry_ok",
+			Output: []OpenAIOutputItem{{Type: "message", Role: "assistant", Content: []OpenAIOutputContent{{Type: "output_text", Text: "ok after retry"}}}},
+			Usage:  OpenAIUsage{InputTokens: 1, OutputTokens: 1},
+		})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := newBasicMessagesRequest()
+
+	proxy.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if backendHits != 2 {
+		t.Fatalf("backend hits = %d, want 2", backendHits)
+	}
+	if !strings.Contains(recorder.Body.String(), "ok after retry") {
+		t.Fatalf("retry response missing: %s", recorder.Body.String())
+	}
 }
 
 func assertAnthropicError(t *testing.T, body, wantType, wantMessageSubstring string) {
@@ -4131,6 +4212,54 @@ func TestHandleMessagesStreamAllowsLongButBoundedToolArguments(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: message_stop") || !strings.Contains(body, "\"type\":\"tool_use\"") {
 		t.Fatalf("bounded long arguments should still translate normally\n%s", body)
+	}
+}
+
+func writeTestSSEEvent(t *testing.T, w io.Writer, event string, payload any) {
+	t.Helper()
+	blob, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal SSE payload: %v", err)
+	}
+	_, _ = io.WriteString(w, "event: "+event+"\n")
+	_, _ = io.WriteString(w, "data: "+string(blob)+"\n\n")
+}
+
+func TestHandleMessagesStreamAllowsSnapshotStyleToolArgumentDeltas(t *testing.T) {
+	first := `{"query":"` + strings.Repeat("a", maxToolArgumentBytes/2) + `"`
+	full := first + `,"limit":10}`
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeTestSSEEvent(t, w, "response.output_item.added", map[string]any{
+			"type": "response.output_item.added",
+			"item": map[string]any{"id": "fc_1", "type": "function_call", "name": "ToolSearch", "call_id": "toolu_1"},
+		})
+		writeTestSSEEvent(t, w, "response.function_call_arguments.delta", map[string]any{
+			"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": first,
+		})
+		writeTestSSEEvent(t, w, "response.function_call_arguments.delta", map[string]any{
+			"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": full,
+		})
+		writeTestSSEEvent(t, w, "response.function_call_arguments.done", map[string]any{
+			"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": full,
+		})
+		writeTestSSEEvent(t, w, "response.completed", map[string]any{
+			"type": "response.completed", "response": map[string]any{"id": "resp_stream", "usage": map[string]any{"input_tokens": 7, "output_tokens": 3}},
+		})
+	}))
+	defer backend.Close()
+
+	proxy := New(Config{BackendBaseURL: backend.URL, BackendPath: "/v1/responses", BackendAPIKey: "rawchat-key"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	proxy.Handler().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("snapshot-style argument deltas should not be rejected\n%s", body)
+	}
+	if !strings.Contains(body, "event: message_stop") || !strings.Contains(body, "\\\"limit\\\":10") {
+		t.Fatalf("snapshot-style arguments should translate once\n%s", body)
 	}
 }
 

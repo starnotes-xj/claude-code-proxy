@@ -23,13 +23,15 @@ import (
 )
 
 const (
-	opaqueReasoningPrefix     = "ccp-reasoning-v1:"
-	compactionCarrierPrefix   = "cm1#"
-	compactionCarrierSep      = "@"
-	defaultThinkingText       = "Thinking..."
-	maxToolArgumentBytes      = 256 * 1024
-	maxToolEmptyDeltaCount    = 8
-	capabilityReprobeLeaseTTL = 15 * time.Second
+	opaqueReasoningPrefix         = "ccp-reasoning-v1:"
+	compactionCarrierPrefix       = "cm1#"
+	compactionCarrierSep          = "@"
+	defaultThinkingText           = "Thinking..."
+	maxToolArgumentBytes          = 1024 * 1024
+	maxToolEmptyDeltaCount        = 8
+	maxTransientBackendRetries    = 2
+	transientBackendRetryBaseWait = 250 * time.Millisecond
+	capabilityReprobeLeaseTTL     = 15 * time.Second
 )
 
 const (
@@ -1574,6 +1576,11 @@ func (p *Proxy) buildBackendRequestWithOptions(ctx context.Context, anthropicReq
 	if opts.EnableReasoning {
 		backendReq.Reasoning = opts.Reasoning
 	}
+	if compactType == compactRequest {
+		backendReq.Tools = nil
+		backendReq.ToolChoice = "none"
+		backendReq.ParallelToolCalls = nil
+	}
 	p.debugf("backend request model=%q stream=%t instructions=%t metadata_keys=%d input_items=%d prompt_cache_key=%t", backendReq.Model, backendReq.Stream, strings.TrimSpace(backendReq.Instructions) != "", len(backendReq.Metadata), len(backendReq.Input), strings.TrimSpace(backendReq.PromptCacheKey) != "")
 	p.debugf("backend input summary: %s", summarizeInputItems(backendReq.Input))
 	p.debugf("backend tool summary: %s", summarizeTools(backendReq.Tools))
@@ -1615,14 +1622,10 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 			return nil, OpenAIResponsesRequest{}, err
 		}
 
-		started := time.Now()
-		resp, err := p.backendHTTPClientFor(payload).Do(req)
-		duration := time.Since(started)
+		resp, err := p.doBackendWithTransientRetry(ctx, payload, req)
 		if err != nil {
-			p.debugf("backend request failed duration=%s request_bytes=%d stream=%t model=%q error=%s", duration, req.ContentLength, payload.Stream, payload.Model, err.Error())
 			return nil, payload, err
 		}
-		p.debugf("backend response status=%d duration=%s request_bytes=%d stream=%t model=%q server=%q cf_ray=%q content_type=%q", resp.StatusCode, duration, req.ContentLength, payload.Stream, payload.Model, resp.Header.Get("Server"), resp.Header.Get("CF-Ray"), resp.Header.Get("Content-Type"))
 		if resp.StatusCode < 400 {
 			p.learnCapabilitiesFromRequest(opts, payload)
 			return resp, payload, nil
@@ -1657,6 +1660,71 @@ func (p *Proxy) doBackendWithAdaptiveRetry(ctx context.Context, anthropicReq Ant
 		opts = nextOpts
 	}
 	return nil, OpenAIResponsesRequest{}, fmt.Errorf("adaptive retry exhausted")
+}
+
+func (p *Proxy) doBackendWithTransientRetry(ctx context.Context, payload OpenAIResponsesRequest, req *http.Request) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		attemptReq := req
+		if attempt > 0 {
+			clone, err := cloneRequestWithBody(req)
+			if err != nil {
+				return nil, err
+			}
+			attemptReq = clone
+		}
+
+		started := time.Now()
+		resp, err := p.backendHTTPClientFor(payload).Do(attemptReq)
+		duration := time.Since(started)
+		if err != nil {
+			p.debugf("backend request failed duration=%s request_bytes=%d stream=%t model=%q attempt=%d error=%s", duration, attemptReq.ContentLength, payload.Stream, payload.Model, attempt+1, err.Error())
+			return nil, err
+		}
+		p.debugf("backend response status=%d duration=%s request_bytes=%d stream=%t model=%q attempt=%d server=%q cf_ray=%q content_type=%q", resp.StatusCode, duration, attemptReq.ContentLength, payload.Stream, payload.Model, attempt+1, resp.Header.Get("Server"), resp.Header.Get("CF-Ray"), resp.Header.Get("Content-Type"))
+		if !shouldRetryTransientBackendResponse(resp) || attempt >= maxTransientBackendRetries {
+			return resp, nil
+		}
+		resp.Body.Close()
+		wait := transientBackendRetryDelay(attempt)
+		p.debugf("retrying transient backend status=%d attempt=%d wait=%s", resp.StatusCode, attempt+1, wait)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func cloneRequestWithBody(req *http.Request) (*http.Request, error) {
+	if req.GetBody == nil {
+		return nil, fmt.Errorf("backend request body is not replayable")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	clone := req.Clone(req.Context())
+	clone.Body = body
+	return clone, nil
+}
+
+func shouldRetryTransientBackendResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func transientBackendRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	return transientBackendRetryBaseWait << attempt
 }
 
 func (p *Proxy) backendHTTPClientFor(payload OpenAIResponsesRequest) *http.Client {
@@ -4253,10 +4321,14 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 		}
 		callID := fallback(event.ItemID, "tool_missing")
 		index := t.startToolBlock(event.ItemID, callID, t.toolNames[event.ItemID])
-		if err := t.trackToolArgumentDelta(event.ItemID, event.Delta); err != nil {
+		delta := t.toolArgumentDeltaSuffix(event.ItemID, event.Delta)
+		if delta == "" && event.Delta != "" {
+			break
+		}
+		if err := t.trackToolArgumentDelta(event.ItemID, delta); err != nil {
 			return err
 		}
-		t.toolArguments[event.ItemID] += event.Delta
+		t.toolArguments[event.ItemID] += delta
 		if t.shouldBufferToolArguments(event.ItemID) {
 			break
 		}
@@ -4265,7 +4337,7 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 			"index": index,
 			"delta": map[string]any{
 				"type":         "input_json_delta",
-				"partial_json": event.Delta,
+				"partial_json": delta,
 			},
 		})
 	case "response.function_call_arguments.done":
@@ -4631,6 +4703,14 @@ func (t *sseTranslator) acceptLateClosedToolArguments(itemID, incoming, source s
 		return fmt.Errorf("duplicate function_call_arguments.done with conflicting arguments")
 	}
 	return fmt.Errorf("%s with conflicting arguments after done", source)
+}
+
+func (t *sseTranslator) toolArgumentDeltaSuffix(itemID, delta string) string {
+	current := t.toolArguments[itemID]
+	if current != "" && strings.HasPrefix(delta, current) {
+		return delta[len(current):]
+	}
+	return delta
 }
 
 func (t *sseTranslator) trackToolArgumentDelta(itemID, delta string) error {
@@ -5115,7 +5195,11 @@ func (a *streamAccumulator) handle(eventName, payload string) error {
 			}
 		}
 	case "response.function_call_arguments.delta":
-		a.argParts[event.ItemID] += event.Delta
+		delta := a.argumentDeltaSuffix(event.ItemID, event.Delta)
+		if delta == "" && event.Delta != "" {
+			break
+		}
+		a.argParts[event.ItemID] += delta
 		item := a.ensureFunctionOutput(event.ItemID)
 		item.Arguments = a.argParts[event.ItemID]
 	case "response.function_call_arguments.done":
@@ -5148,6 +5232,14 @@ func (a *streamAccumulator) handle(eventName, payload string) error {
 	}
 
 	return nil
+}
+
+func (a *streamAccumulator) argumentDeltaSuffix(itemID, delta string) string {
+	current := a.argParts[itemID]
+	if current != "" && strings.HasPrefix(delta, current) {
+		return delta[len(current):]
+	}
+	return delta
 }
 
 func (a *streamAccumulator) mergeResponse(resp OpenAIResponsesResponse) {
