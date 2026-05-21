@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"claude-codex-proxy/internal/claudecodexproxy"
+	claudecodexproxy "claude-codex-proxy/internal"
 )
 
 func main() {
