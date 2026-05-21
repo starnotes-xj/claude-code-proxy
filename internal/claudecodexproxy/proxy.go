@@ -70,6 +70,9 @@ type Proxy struct {
 	unsupportedUntil map[string]time.Time
 	reprobeUntil     map[string]time.Time
 	now              func() time.Time
+	rateMu           sync.Mutex
+	lastRequestTime  time.Time
+	usageStore       usageStore
 }
 
 type capabilityState uint8
@@ -180,6 +183,11 @@ type requestFeatures struct {
 }
 
 func New(cfg Config) *Proxy {
+	store, err := newUsageStore(cfg.UsageDBPath)
+	if err != nil {
+		log.Printf("[claude-codex-proxy] usage store init failed: %v", err)
+		store, _ = newUsageStore("")
+	}
 	return &Proxy{
 		cfg: cfg,
 		httpClient: &http.Client{
@@ -194,6 +202,7 @@ func New(cfg Config) *Proxy {
 		unsupportedUntil: map[string]time.Time{},
 		reprobeUntil:     map[string]time.Time{},
 		now:              time.Now,
+		usageStore:       store,
 	}
 }
 
@@ -207,6 +216,8 @@ func (p *Proxy) Handler() http.Handler {
 	mux.HandleFunc("/v1/messages", p.requireClientAuth(p.handleMessages))
 	mux.HandleFunc("/v1/messages/count_tokens", p.requireClientAuth(p.handleCountTokens))
 	mux.HandleFunc("/v1/models", p.requireClientAuth(p.handleModels))
+	mux.HandleFunc("/v1/usage", p.requireClientAuth(p.handleUsage))
+	mux.HandleFunc("/v1/usage/dashboard", p.requireClientAuth(p.handleUsageDashboard))
 	return mux
 }
 
@@ -222,17 +233,26 @@ func (p *Proxy) requireClientAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (p *Proxy) isAuthorizedClient(r *http.Request) bool {
-	expected := strings.TrimSpace(p.cfg.ClientAPIKey)
-	if expected == "" {
+	keys := p.cfg.effectiveClientAPIKeys()
+	if len(keys) == 0 {
 		return true
 	}
-
-	if provided := strings.TrimSpace(r.Header.Get("x-api-key")); secureSecretCompare(provided, expected) {
-		return true
+	provided := strings.TrimSpace(r.Header.Get("x-api-key"))
+	for _, expected := range keys {
+		if secureSecretCompare(provided, expected) {
+			return true
+		}
 	}
-
 	token, ok := bearerToken(r.Header.Get("Authorization"))
-	return ok && secureSecretCompare(token, expected)
+	if !ok {
+		return false
+	}
+	for _, expected := range keys {
+		if secureSecretCompare(token, expected) {
+			return true
+		}
+	}
+	return false
 }
 
 func bearerToken(raw string) (string, bool) {
@@ -1379,6 +1399,9 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
+	if !p.checkRateLimit(r.Context(), w) {
+		return
+	}
 
 	maxBodyBytes := p.cfg.EffectiveMaxInboundBodyBytes()
 	p.debugf("incoming request content_length=%d max_inbound_body_bytes=%d", r.ContentLength, maxBodyBytes)
@@ -1435,6 +1458,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, ctx context.Context, anth
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
 			return
 		}
+		p.recordUsage(anthropicResp.Model, "messages", anthropicResp.Usage)
 		writeJSON(w, http.StatusOK, anthropicResp)
 		return
 	}
@@ -1451,6 +1475,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, ctx context.Context, anth
 		return
 	}
 
+	p.recordUsage(anthropicResp.Model, "messages", anthropicResp.Usage)
 	writeJSON(w, http.StatusOK, anthropicResp)
 }
 
@@ -1482,6 +1507,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, ctx context.Context, anthrop
 		if err := translator.consume(resp.Body); err != nil {
 			translator.writeAnthropicStreamError(err.Error())
 		}
+		p.recordUsage(advertisedModel, "messages", translator.capturedUsage)
 		return
 	}
 
@@ -1497,6 +1523,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, ctx context.Context, anthrop
 		return
 	}
 
+	p.recordUsage(advertisedModel, "messages", anthropicResp.Usage)
 	newSSETranslator(w, flusher, advertisedModel, fallback(anthropicResp.ID, p.nextID("msg")), p.debugf).emitResponse(anthropicResp)
 }
 
@@ -1533,9 +1560,18 @@ func (p *Proxy) buildBackendRequestWithOptions(ctx context.Context, anthropicReq
 		input = stripRoundTripHistoryItemIDs(input)
 	}
 
+	instructions := systemBlocksToInstructions(systemBlocks)
+	if extra := p.cfg.extraSystemPromptForModel(opts.Model); extra != "" {
+		if instructions == "" {
+			instructions = extra
+		} else {
+			instructions = instructions + "\n\n" + extra
+		}
+	}
+
 	backendReq := OpenAIResponsesRequest{
 		Model:           opts.Model,
-		Instructions:    systemBlocksToInstructions(systemBlocks),
+		Instructions:    instructions,
 		Input:           input,
 		Tools:           convertTools(anthropicReq.Tools),
 		ToolChoice:      convertToolChoice(anthropicReq.ToolChoice),
@@ -4152,6 +4188,7 @@ type sseTranslator struct {
 	closedReasoning   map[string]bool
 	reasoningBuffers  map[string]*strings.Builder
 	toolNames         map[string]string
+	capturedUsage     AnthropicUsage
 }
 
 func newSSETranslator(w io.Writer, flusher http.Flusher, advertisedModel, messageID string, debugf func(string, ...any)) *sseTranslator {
@@ -4518,6 +4555,7 @@ func (t *sseTranslator) handleEvent(eventName, payload string) error {
 				InputTokens:  event.Response.Usage.InputTokens,
 				OutputTokens: event.Response.Usage.OutputTokens,
 			}
+			t.capturedUsage = usage
 		} else if t.seenToolUse {
 			stopReason = "tool_use"
 		}
