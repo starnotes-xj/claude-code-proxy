@@ -32,6 +32,7 @@ type Config struct {
 	BackendPath                   string
 	BackendAPIKey                 string
 	ClientAPIKey                  string
+	ClientAPIKeys                 []string
 	BackendModel                  string
 	BackendWarmupModel            string
 	AnthropicModelAlias           string
@@ -55,6 +56,10 @@ type Config struct {
 	MaxBackendRequestBytes        int64
 	MaxBackendErrorBodyBytes      int64
 	Debug                         bool
+	RateLimitInterval             time.Duration
+	RateLimitWait                 bool
+	ExtraSystemPrompts            map[string]string
+	UsageDBPath                   string
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -95,6 +100,7 @@ func LoadConfigFromEnv() (Config, error) {
 		cfg.RequestTimeout = timeout
 	}
 
+	cfg.ClientAPIKeys = parseCSVEnvAllowlist(os.Getenv("CLAUDE_CODE_PROXY_CLIENT_API_KEYS"))
 	cfg.AnthropicModelAlias = strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_ANTHROPIC_MODEL_ALIAS"))
 	cfg.BackendReasoningEffort = strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_BACKEND_REASONING_EFFORT"))
 
@@ -223,8 +229,35 @@ func LoadConfigFromEnv() (Config, error) {
 		}
 		cfg.CapabilityReprobeTTL = parsed
 	}
-	if !isLoopbackListenAddr(cfg.ListenAddr) && cfg.ClientAPIKey == "" {
-		return Config{}, fmt.Errorf("missing CLAUDE_CODE_PROXY_CLIENT_API_KEY for non-loopback CLAUDE_CODE_PROXY_LISTEN_ADDR")
+
+	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_RATE_LIMIT_INTERVAL")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid CLAUDE_CODE_PROXY_RATE_LIMIT_INTERVAL: %w", err)
+		}
+		cfg.RateLimitInterval = parsed
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_RATE_LIMIT_WAIT")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid CLAUDE_CODE_PROXY_RATE_LIMIT_WAIT: %w", err)
+		}
+		cfg.RateLimitWait = parsed
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_EXTRA_SYSTEM_PROMPTS")); raw != "" {
+		var prompts map[string]string
+		if err := json.Unmarshal([]byte(raw), &prompts); err != nil {
+			return Config{}, fmt.Errorf("invalid CLAUDE_CODE_PROXY_EXTRA_SYSTEM_PROMPTS: %w", err)
+		}
+		cfg.ExtraSystemPrompts = prompts
+	}
+
+	cfg.UsageDBPath = strings.TrimSpace(os.Getenv("CLAUDE_CODE_PROXY_USAGE_DB_PATH"))
+
+	if !isLoopbackListenAddr(cfg.ListenAddr) && len(cfg.effectiveClientAPIKeys()) == 0 {
+		return Config{}, fmt.Errorf("missing CLAUDE_CODE_PROXY_CLIENT_API_KEY or CLAUDE_CODE_PROXY_CLIENT_API_KEYS for non-loopback CLAUDE_CODE_PROXY_LISTEN_ADDR")
 	}
 
 	return cfg, nil
@@ -232,6 +265,27 @@ func LoadConfigFromEnv() (Config, error) {
 
 func (c Config) BackendURL() string {
 	return c.BackendBaseURL + c.BackendPath
+}
+
+func (c Config) effectiveClientAPIKeys() []string {
+	seen := map[string]bool{}
+	var keys []string
+	for _, k := range append([]string{c.ClientAPIKey}, c.ClientAPIKeys...) {
+		t := strings.TrimSpace(k)
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		keys = append(keys, t)
+	}
+	return keys
+}
+
+func (c Config) extraSystemPromptForModel(model string) string {
+	if len(c.ExtraSystemPrompts) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(c.ExtraSystemPrompts[strings.TrimSpace(model)])
 }
 
 func (c Config) BackendModelsURL() string {
