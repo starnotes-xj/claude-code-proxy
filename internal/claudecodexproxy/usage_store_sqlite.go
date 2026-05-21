@@ -34,6 +34,11 @@ func newUsageStore(path string) (usageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("create table: %w", err)
 	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_token_usage_events_created_at_model
+		ON token_usage_events(created_at_ms, model)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create index: %w", err)
+	}
 	return &sqliteUsageStore{db: db}, nil
 }
 
@@ -84,6 +89,9 @@ func (s *sqliteUsageStore) QuerySummary(period string) (usageSummary, error) {
 		summary.TotalEvents += mu.Events
 		summary.TotalInput += mu.InputTokens
 		summary.TotalOutput += mu.OutputTokens
+	}
+	if err := rows.Err(); err != nil {
+		return usageSummary{}, err
 	}
 	sort.Slice(summary.ByModel, func(i, j int) bool {
 		return summary.ByModel[i].Model < summary.ByModel[j].Model

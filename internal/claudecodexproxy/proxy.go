@@ -73,6 +73,9 @@ type Proxy struct {
 	rateMu           sync.Mutex
 	lastRequestTime  time.Time
 	usageStore       usageStore
+	usageEvents      chan usageEvent
+	usageWorkerDone  chan struct{}
+	closeOnce        sync.Once
 }
 
 type capabilityState uint8
@@ -188,7 +191,7 @@ func New(cfg Config) *Proxy {
 		log.Printf("[claude-codex-proxy] usage store init failed: %v", err)
 		store, _ = newUsageStore("")
 	}
-	return &Proxy{
+	proxy := &Proxy{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: cfg.RequestTimeout,
@@ -204,6 +207,26 @@ func New(cfg Config) *Proxy {
 		now:              time.Now,
 		usageStore:       store,
 	}
+	if _, ok := store.(*noopUsageStore); !ok {
+		proxy.usageEvents = make(chan usageEvent, 1024)
+		proxy.usageWorkerDone = make(chan struct{})
+		go proxy.usageWorker()
+	}
+	return proxy
+}
+
+func (p *Proxy) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		if p.usageEvents != nil {
+			close(p.usageEvents)
+			<-p.usageWorkerDone
+		}
+		if p.usageStore != nil {
+			err = p.usageStore.Close()
+		}
+	})
+	return err
 }
 
 func NewBackendRequestForTest(ctx context.Context, cfg Config, req AnthropicMessagesRequest, headers http.Header) (*http.Request, error) {

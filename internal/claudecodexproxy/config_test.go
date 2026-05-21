@@ -654,6 +654,46 @@ func TestLoadConfigFromEnvAllowsNonLoopbackListenWithClientAPIKey(t *testing.T) 
 	}
 }
 
+func TestLoadConfigFromEnvAllowsNonLoopbackListenWithClientAPIKeysOnly(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "backend-key")
+	t.Setenv("CLAUDE_CODE_PROXY_LISTEN_ADDR", "0.0.0.0:8787")
+	t.Setenv("CLAUDE_CODE_PROXY_CLIENT_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_PROXY_CLIENT_API_KEYS", "key-a,key-b")
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("LoadConfigFromEnv() error = %v", err)
+	}
+	if !reflect.DeepEqual(cfg.ClientAPIKeys, []string{"key-a", "key-b"}) {
+		t.Fatalf("ClientAPIKeys = %#v, want [key-a key-b]", cfg.ClientAPIKeys)
+	}
+}
+
+func TestConfigEffectiveClientAPIKeysTrimsAndDeduplicates(t *testing.T) {
+	cfg := Config{
+		ClientAPIKey:  " key-a ",
+		ClientAPIKeys: []string{"", "key-b", "key-a", " key-b ", "key-c"},
+	}
+	if got, want := cfg.effectiveClientAPIKeys(), []string{"key-a", "key-b", "key-c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("effectiveClientAPIKeys() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadConfigFromEnvRejectsInvalidExtraSystemPromptsJSON(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
+	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_API_KEY", "backend-key")
+	t.Setenv("CLAUDE_CODE_PROXY_EXTRA_SYSTEM_PROMPTS", `{"claude-sonnet-4-5":"prompt"`)
+
+	_, err := LoadConfigFromEnv()
+	if err == nil {
+		t.Fatalf("LoadConfigFromEnv() error = nil, want invalid extra system prompts error")
+	}
+	if !strings.Contains(err.Error(), "CLAUDE_CODE_PROXY_EXTRA_SYSTEM_PROMPTS") {
+		t.Fatalf("error = %q, want extra system prompts env name", err)
+	}
+}
+
 func setRequiredBackendBaseEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("CLAUDE_CODE_PROXY_BACKEND_BASE_URL", "https://backend.example/codex")
