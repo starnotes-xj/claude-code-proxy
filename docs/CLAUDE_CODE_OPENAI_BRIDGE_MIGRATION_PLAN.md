@@ -2,11 +2,13 @@
 
 ## 背景
 
-当前项目中的 `cmd/claude-codex-proxy` / `internal/claudecodexproxy` 已经可以把 Claude Code 的 Anthropic Messages 请求转换成 OpenAI Responses 风格请求，并在兼容的 OpenAI-format 后端上完成基本可用的桥接。
+当前项目（入口 `main.go`，包 `internal/`，包名 `claudecodexproxy`）已经可以把 Claude Code 的 Anthropic Messages 请求转换成 OpenAI Responses 风格请求，并在兼容的 OpenAI-format 后端上完成基本可用的桥接。
+
+> 历史路径说明：代码曾位于 `cmd/claude-codex-proxy` 与 `internal/claudecodexproxy/`，已分别整合到 `main.go` 与 `internal/`（包名仍为 `claudecodexproxy`）。
 
 但目标不应绑定某一个站点或默认后端，而应当是：
 
-> **只要后端提供“足够兼容的 OpenAI 格式接口/能力”，就能通过本工具让 Claude Code 尽可能正常地使用 coding / MCP / subagent / team 能力。**
+> **只要后端提供”足够兼容的 OpenAI 格式接口/能力”，就能通过本工具让 Claude Code 尽可能正常地使用 coding / MCP / subagent / team 能力。**
 
 参考仓库：
 
@@ -15,14 +17,18 @@
 
 该参考仓库虽面向 GitHub Copilot，但其中有不少 **Claude Code 语义兼容层** 是通用可迁移的。
 
-结合当前仓库的 `README.md`、`internal/claudecodexproxy/config.go` 与 `internal/claudecodexproxy/proxy.go`，可以先明确一个现实基线：
+结合当前仓库的 `README.md`、`internal/config.go` 与 `internal/proxy.go`，可以先明确一个现实基线：
 
-- 当前仓库的**运维/接入基线**已经不只是“能转协议”
+- 当前仓库的**运维/接入基线**已经不只是”能转协议”
 - 已经形成了：
   - Codex / Claude Code 配置发现与后端 fallback
-  - 非 loopback 监听下的 client API key 鉴权
+  - 非 loopback 监听下的 client API key 鉴权，支持单密钥（`CLAUDE_CODE_PROXY_CLIENT_API_KEY`）与多密钥（`CLAUDE_CODE_PROXY_CLIENT_API_KEYS`，逗号分隔，合并去重）
   - metadata / continuity / `prompt_cache_key` 的隐私分级开关
   - Docker / 本地运行的文档化接入路径
+  - 请求间隔限流（`CLAUDE_CODE_PROXY_RATE_LIMIT_INTERVAL` / `_WAIT`：固定等待或直接返回 `429`）
+  - 按后端模型名注入额外 system prompt（`CLAUDE_CODE_PROXY_EXTRA_SYSTEM_PROMPTS`，JSON map）
+  - 可选 SQLite Token 用量持久化（`-tags sqlite` 编译 + `CLAUDE_CODE_PROXY_USAGE_DB_PATH`）与 JSON/HTML 仪表板（`/v1/usage`、`/v1/usage/dashboard`）
+  - 请求体积保护（`MAX_INBOUND_BODY_BYTES`、`MAX_BACKEND_REQUEST_BYTES`、`MAX_BACKEND_ERROR_BODY_BYTES`）
 
 因此，这份迁移计划后续应把重心继续放在 **通用协议语义、能力探测、流式稳定性、continuity 保真** 上，而不是把大量精力重新投入到部署包装层。
 
@@ -680,14 +686,14 @@
 
 主要落点：
 
-- `internal/claudecodexproxy/proxy.go`
+- `internal/proxy.go`
   - `deriveContinuityContext(...)`
   - `deriveSessionAffinity(...)`
   - `deriveParentSessionID(...)`
   - `deriveInteractionType(...)`
   - `deriveInteractionID(...)`
   - `buildBackendRequestWithOptions(...)`
-- `internal/claudecodexproxy/proxy_test.go`
+- `internal/proxy_test.go`
   - 已有 continuity 基线测试可继续扩：
     - `TestBuildBackendRequestDerivesContinuityMetadataFromSessionAndSubagent`
     - `TestBuildBackendRequestAddsSecondWaveContinuityMetadata`
@@ -709,13 +715,13 @@
 
 主要落点：
 
-- `internal/claudecodexproxy/proxy.go`
+- `internal/proxy.go`
   - `seedCapabilitiesFromModels(...)`
   - `extractBackendModelProfile(...)`
   - `optionsForRequest(...)`
   - `selectBackendModel(...)`
   - `modelProfileSupportsRequest(...)`
-- `internal/claudecodexproxy/proxy_test.go`
+- `internal/proxy_test.go`
   - 已有模型能力初始化测试可继续扩：
     - `TestBuildBackendRequestEnablesParallelToolCallsWhenProfileSupportsIt`
     - `TestBuildBackendRequestDowngradesHighReasoningWhenMaxThinkingBudgetIsSmall`
@@ -738,12 +744,12 @@
 
 主要落点：
 
-- `internal/claudecodexproxy/proxy.go`
+- `internal/proxy.go`
   - `detectCompactType(...)`
   - `isWarmupRequest(...)`
   - `resolveWarmupModel(...)`
   - `mergeToolResultForClaude(...)`
-- `internal/claudecodexproxy/proxy_test.go`
+- `internal/proxy_test.go`
   - `TestBuildBackendRequestSkipsLastMergeForCompactRequest`
   - `TestBuildBackendRequestRoutesWarmupNoToolsAnthropicBetaToWarmupModel`
   - `TestBuildBackendRequestDoesNotUseWarmupModelForOrdinaryRequests`
@@ -765,12 +771,12 @@
 
 主要落点：
 
-- `internal/claudecodexproxy/proxy.go`
+- `internal/proxy.go`
   - `compactInputByLatestCompaction(...)`
   - `downgradeCompactionInputItems(...)`
   - `dropCompactionInputItems(...)`
   - `requestContainsCompactionCarrier(...)`
-- `internal/claudecodexproxy/proxy_test.go`
+- `internal/proxy_test.go`
   - `TestBuildBackendRequestConvertsCompactionCarrier`
   - `TestBuildBackendRequestInjectsContextManagementCompactionWhenProfileAllows`
   - `TestBuildBackendRequestKeepsOnlyLatestCompactionAndFollowingItems`
@@ -792,12 +798,12 @@
 
 主要落点：
 
-- `internal/claudecodexproxy/proxy.go`
+- `internal/proxy.go`
   - `sseTranslator.trackToolArgumentDelta(...)`
   - `classifyCapabilityFailure(...)`
   - `requestUsesRoundTripHistoryItems(...)`
   - `matchesInputItemPersistenceFailure(...)`
-- `internal/claudecodexproxy/proxy_test.go`
+- `internal/proxy_test.go`
   - `TestHandleMessagesStreamAllowsWhitespaceOnlyFunctionCallArgumentDeltas`
   - `TestHandleMessagesStreamRejectsDeltaAfterToolDone`
   - `TestHandleMessagesStreamRejectsOversizedToolArguments`
@@ -819,15 +825,15 @@
 
 主要落点：
 
-- `internal/claudecodexproxy/proxy.go`
+- `internal/proxy.go`
   - `effectiveCapabilityStateLocked(...)`
   - `setCapabilityCooldownLocked(...)`
   - `clearCapabilityCooldownLocked(...)`
   - `countTokensViaAnthropic(...)`
   - token fallback / debug 输出相关逻辑
-- `internal/claudecodexproxy/config.go`
+- `internal/config.go`
   - `CapabilityReprobeTTL` 配置项
-- `internal/claudecodexproxy/proxy_test.go`
+- `internal/proxy_test.go`
   - `TestHandleMessagesStreamTTLReprobeUsesSingleLeaderAndKeepsAnthropicSSE`
   - `TestHandleMessagesAnonymousModeDoesNotConsumePromptCacheKeyTTLReprobeLease`
 
@@ -873,6 +879,25 @@
 
 ## 当前判断
 
+### 代码结构（截止 2026-05-21）
+
+- 入口：`main.go`（原 `cmd/claude-codex-proxy` 已消除）
+- 包路径：`claude-codex-proxy/internal`（原 `claude-codex-proxy/internal/claudecodexproxy` 已扁平化）；包名仍为 `claudecodexproxy`
+- `internal/config.go`、`internal/proxy.go`、`internal/ratelimit.go`、`internal/dashboard.go`、`internal/usage_store*.go`
+- Todo 落点中所有文件路径均已更新为 `internal/` 前缀
+
+### 运维/接入基线新增（本阶段落地）
+
+6. 多客户端共享密钥（`CLIENT_API_KEYS` 逗号分隔，与 `CLIENT_API_KEY` 合并去重）
+7. 请求间隔限流（`RATE_LIMIT_INTERVAL` / `RATE_LIMIT_WAIT`）
+8. 按后端模型注入额外 system prompt（`EXTRA_SYSTEM_PROMPTS`，JSON map）
+9. 可选 SQLite Token 用量持久化（`-tags sqlite` 编译 + `USAGE_DB_PATH`）与仪表板（`/v1/usage`、`/v1/usage/dashboard`）
+10. 请求体积保护（`MAX_INBOUND_BODY_BYTES`、`MAX_BACKEND_REQUEST_BYTES`、`MAX_BACKEND_ERROR_BODY_BYTES`）
+
+以上均属运维/接入层增强，与协议语义迁移任务正交，不影响 Phase 2–3 任务的推进顺序。
+
+### 协议/语义层
+
 从当前仓库代码、README、真实 E2E 与本轮回归测试看，当前 bridge 已经跨过：
 
 1. MCP 工具调用可用
@@ -889,6 +914,6 @@
 4. **stream/provider 顺序兼容**：补更细粒度 provider 顺序偏差测试，而不是继续放宽主逻辑
 5. **error classifier 结构化升级**：逐步减少纯字符串匹配依赖
 
-也就是说，路线已经从“让 Claude Code 能跑起来”进入：
+也就是说，路线已经从”让 Claude Code 能跑起来”进入：
 
 > **让通用 OpenAI-format backend 在 Claude Code / agent team / MCP 场景下持续稳定运行，并把剩余边角兼容问题收敛成更小、更明确的增量工作。**
