@@ -34,9 +34,9 @@ type usageStore interface {
 
 type noopUsageStore struct{}
 
-func (*noopUsageStore) RecordUsage(_ usageEvent) error           { return nil }
+func (*noopUsageStore) RecordUsage(_ usageEvent) error              { return nil }
 func (*noopUsageStore) QuerySummary(_ string) (usageSummary, error) { return usageSummary{}, nil }
-func (*noopUsageStore) Close() error                              { return nil }
+func (*noopUsageStore) Close() error                                { return nil }
 
 func (p *Proxy) recordUsage(model, endpoint string, usage AnthropicUsage) {
 	if p.usageStore == nil {
@@ -49,9 +49,24 @@ func (p *Proxy) recordUsage(model, endpoint string, usage AnthropicUsage) {
 		InputTokens:  usage.InputTokens,
 		OutputTokens: usage.OutputTokens,
 	}
-	go func() {
+	if p.usageEvents != nil {
+		select {
+		case p.usageEvents <- event:
+		default:
+			p.debugf("usage record dropped: queue full")
+		}
+		return
+	}
+	if err := p.usageStore.RecordUsage(event); err != nil {
+		p.debugf("usage record failed: %v", err)
+	}
+}
+
+func (p *Proxy) usageWorker() {
+	defer close(p.usageWorkerDone)
+	for event := range p.usageEvents {
 		if err := p.usageStore.RecordUsage(event); err != nil {
 			p.debugf("usage record failed: %v", err)
 		}
-	}()
+	}
 }

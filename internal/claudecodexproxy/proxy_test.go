@@ -9011,6 +9011,40 @@ func TestBuildBackendRequestMapsSystemToInstructions(t *testing.T) {
 	}
 }
 
+func TestBuildBackendRequestAppendsExtraSystemPromptToInstructions(t *testing.T) {
+	cfg := Config{
+		BackendBaseURL: "https://example.com/codex",
+		BackendPath:    "/v1/responses",
+		BackendAPIKey:  "test-key",
+		BackendModel:   "gpt-5.4",
+		ExtraSystemPrompts: map[string]string{
+			"gpt-5.4": "Extra rule",
+		},
+	}
+
+	req, err := NewBackendRequestForTest(context.Background(), cfg, AnthropicMessagesRequest{
+		Model: "claude-sonnet-4-5",
+		System: []any{
+			map[string]any{"type": "text", "text": "Rule one"},
+		},
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: "hello"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	var payload OpenAIResponsesRequest
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode backend request: %v", err)
+	}
+
+	if payload.Instructions != "Rule one\n\nExtra rule" {
+		t.Fatalf("instructions = %q, want system + extra prompt", payload.Instructions)
+	}
+}
+
 func TestBuildBackendRequestMapsThinkingToReasoningEffort(t *testing.T) {
 	cfg := Config{
 		BackendBaseURL: "https://example.com/codex",
