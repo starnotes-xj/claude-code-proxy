@@ -23,3 +23,8 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Local data / SQLite databases
+*.db
+*.db-shm
+*.db-wal
